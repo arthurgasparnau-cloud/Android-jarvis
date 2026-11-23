@@ -93,6 +93,14 @@ class MainActivity : Activity() {
                     }
                 }
                 WakeWordService.ACTION_WAKE -> startWakeVoiceInput()
+                WakeWordService.ACTION_RESPONSE -> {
+                    val response = intent.getStringExtra(WakeWordService.EXTRA_RESPONSE).orEmpty()
+                    if (response.isNotBlank()) {
+                        prefs.edit().remove("pending_voice_response").apply()
+                        addBubble("J.A.R.V.I.S.", response, false)
+                        setStatus("Resposta recebida do núcleo", true)
+                    }
+                }
                 WakeWordService.ACTION_COMMAND -> {
                     val command = intent.getStringExtra(WakeWordService.EXTRA_COMMAND).orEmpty()
                     prefs.edit().remove("pending_voice_command").apply()
@@ -1027,6 +1035,7 @@ class MainActivity : Activity() {
                 addAction(WakeWordService.ACTION_AUDIO_LEVEL)
                 addAction(WakeWordService.ACTION_WAKE)
                 addAction(WakeWordService.ACTION_COMMAND)
+                addAction(WakeWordService.ACTION_RESPONSE)
                 addAction(WakeWordService.ACTION_STOP_SPEAKING)
             }
             if (Build.VERSION.SDK_INT >= 33) registerReceiver(wakeReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -1062,6 +1071,11 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        val pendingResponse = prefs.getString("pending_voice_response", "").orEmpty()
+        if (pendingResponse.isNotBlank()) {
+            prefs.edit().remove("pending_voice_response").apply()
+            addBubble("J.A.R.V.I.S.", pendingResponse, false)
+        }
         val pending = prefs.getString("pending_voice_command", "").orEmpty()
         if (pending.isNotBlank()) {
             prefs.edit().remove("pending_voice_command").apply()

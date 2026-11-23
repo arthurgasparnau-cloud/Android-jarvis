@@ -9,8 +9,14 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioRecord
+import android.media.AudioTrack
+import android.util.Base64
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.Handler
@@ -40,6 +46,8 @@ class WakeWordService : Service() {
         const val ACTION_STATE = "com.jarvis.mobile.WAKE_STATE"
         const val ACTION_WAKE = "com.jarvis.mobile.WAKE_DETECTED"
         const val ACTION_COMMAND = "com.jarvis.mobile.WAKE_COMMAND"
+        const val ACTION_RESPONSE = "com.jarvis.mobile.WAKE_RESPONSE"
+        const val EXTRA_RESPONSE = "response"
         const val ACTION_AUDIO_LEVEL = "com.jarvis.mobile.WAKE_AUDIO_LEVEL"
         const val EXTRA_AUDIO_LEVEL = "audio_level"
         const val ACTION_STOP_SPEAKING = "com.jarvis.mobile.STOP_SPEAKING"
@@ -61,6 +69,7 @@ class WakeWordService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var commandSessionActive = false
     private var awaitingCommand = false
+    @Volatile private var processingCommand = false
     private var lastCommandAt = 0L
 
     // A conversa nÃ£o expira por silÃªncio: o reconhecedor permanece ativo
@@ -320,10 +329,6 @@ class WakeWordService : Service() {
                     } else if (awaitingCommand && phrase.isNotBlank()) {
                         awaitingCommand = false
                         handleRecognizedCommand(phrase)
-                        commandSessionActive = false
-                        try { speechRecognizer?.cancel() } catch (_: Exception) {}
-                        speechRecognizer?.destroy()
-                        speechRecognizer = null
                     } else if (commandSessionActive) {
                         mainHandler.postDelayed({ startCommandSession() }, 350L)
                     }
@@ -394,13 +399,175 @@ class WakeWordService : Service() {
         try { speechRecognizer?.cancel() } catch (_: Exception) {}
         speechRecognizer?.destroy()
         speechRecognizer = null
-        prefs.edit().putString("pending_voice_command", phrase).apply()
-        sendBroadcast(
-            Intent(ACTION_COMMAND).setPackage(packageName).putExtra(EXTRA_COMMAND, phrase)
-        )
-        updateNotification("Comando reconhecido â€¢ processando no núcleo")
-        sendState("Comando reconhecido â€¢ enviando ao núcleo")
+        awaitingCommand = false
         lastCommandAt = SystemClock.elapsedRealtime()
+        if (tryLaunchPhoneApp(command)) {
+            mainHandler.postDelayed({ startCommandSession() }, 700L)
+            return
+        }
+        processVoiceCommand(phrase)
+    }
+
+    private fun tryLaunchPhoneApp(command: String): Boolean {
+        val prefixes = listOf("abra ", "abrir ", "abre ", "inicie ", "iniciar ", "execute ", "executar ", "open ", "launch ")
+        val prefix = prefixes.firstOrNull { command.startsWith(it) } ?: return false
+        var target = command.removePrefix(prefix).trim()
+        target = target.removePrefix("o ").removePrefix("a ").removePrefix("app ").removePrefix("aplicativo ").trim()
+        if (target.isBlank()) return false
+
+        val knownPackages = when (target) {
+            "google", "pesquisa google", "pesquisa do google" -> listOf("com.google.android.googlequicksearchbox", "com.android.chrome")
+            "youtube", "you tube" -> listOf("com.google.android.youtube")
+            "chrome", "google chrome", "navegador" -> listOf("com.android.chrome")
+            else -> emptyList()
+        }
+        val packageMatch = knownPackages.firstNotNullOfOrNull { packageName ->
+            packageManager.getLaunchIntentForPackage(packageName)?.let { packageName to it }
+        }
+        val intent = packageMatch?.second ?: run {
+            val launcher = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+            val match = packageManager.queryIntentActivities(launcher, 0).firstOrNull { info ->
+                val label = info.loadLabel(packageManager)?.toString().orEmpty()
+                val normalizedLabel = java.text.Normalizer.normalize(label.lowercase(Locale("pt", "BR")), java.text.Normalizer.Form.NFD)
+                    .replace("\\p{Mn}+".toRegex(), "")
+                normalizedLabel.contains(target) || target.contains(normalizedLabel)
+            } ?: return false
+            packageManager.getLaunchIntentForPackage(match.activityInfo.packageName) ?: return false
+        }
+
+        return try {
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(intent)
+            updateNotification("Abrindo ${if (target == "google") "Google" else target}")
+            sendState("Abrindo aplicativo: $target")
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    // O serviço executa comandos de voz sem depender da Activity estar aberta.
+    // A tela recebe apenas o resultado para atualizar o histórico visual.
+    private fun processVoiceCommand(phrase: String) {
+        if (processingCommand) {
+            updateNotification("Comando recebido • aguardando o anterior")
+            return
+        }
+        processingCommand = true
+        updateNotification("Comando reconhecido • consultando núcleo")
+        sendState("Comando reconhecido • processando no núcleo")
+        thread(name = "Jarvis-Voice-Command") {
+            var answer = ""
+            try {
+                val baseUrl = prefs.getString("base_url", "https://arthur.tail25244c.ts.net")
+                    ?: "https://arthur.tail25244c.ts.net"
+                val token = prefs.getString("token", "").orEmpty()
+                if (token.isBlank()) throw IllegalStateException("Conexão com o núcleo não configurada no aplicativo.")
+                var conversationId = prefs.getString("conversation_id", "").orEmpty()
+                if (conversationId.isBlank()) {
+                    val created = coreRequest(baseUrl, token, "POST", "/api/conversations", JSONObject())
+                    conversationId = created.optString("id")
+                    if (conversationId.isBlank()) throw IllegalStateException("Não foi possível iniciar uma conversa com o núcleo.")
+                    prefs.edit().putString("conversation_id", conversationId).apply()
+                }
+                val body = JSONObject()
+                    .put("message", phrase)
+                    .put("conversation_id", conversationId)
+                    .put("source", "android_background_voice")
+                val response = coreRequest(baseUrl, token, "POST", "/api/chat", body)
+                answer = response.optString("answer", "").trim()
+                if (answer.isBlank()) throw IllegalStateException("O núcleo não retornou uma resposta.")
+                prefs.edit().putString("pending_voice_response", answer).apply()
+                sendBroadcast(Intent(ACTION_RESPONSE).setPackage(packageName).putExtra(EXTRA_RESPONSE, answer))
+
+                updateNotification("Resposta recebida • gerando voz Brian")
+                try {
+                    val voice = coreRequest(baseUrl, token, "POST", "/api/tts", JSONObject().put("text", answer))
+                    val encoded = voice.optString("audio_base64", "")
+                    if (encoded.isBlank()) throw IllegalStateException("O serviço de voz não retornou áudio.")
+                    val pcm = Base64.decode(encoded, Base64.DEFAULT)
+                    playBrianAudio(pcm, voice.optInt("sample_rate", 24000))
+                } catch (voiceError: Exception) {
+                    sendState("Resposta recebida, mas a voz Brian falhou: ${voiceError.message ?: "erro de áudio"}")
+                }
+            } catch (error: Exception) {
+                val message = error.message ?: "Falha ao processar o comando."
+                prefs.edit().putString("pending_voice_response", "Não consegui concluir: $message").apply()
+                sendBroadcast(Intent(ACTION_RESPONSE).setPackage(packageName).putExtra(EXTRA_RESPONSE, "Não consegui concluir: $message"))
+                sendState("Falha no comando: $message")
+            } finally {
+                processingCommand = false
+                if (prefs.getBoolean("wake_enabled", true)) {
+                    mainHandler.post {
+                        updateNotification("Google ouvindo • aguardando Hey JARVIS")
+                        sendState("Resposta concluída • Google aguardando Hey JARVIS")
+                        mainHandler.postDelayed({ startCommandSession() }, 700L)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun coreRequest(baseUrl: String, token: String, method: String, path: String, body: JSONObject? = null): JSONObject {
+        val connection = (URL(baseUrl.trimEnd('/') + path).openConnection() as HttpURLConnection)
+        connection.requestMethod = method
+        connection.connectTimeout = 15000
+        connection.readTimeout = if (path == "/api/chat") 190000 else 30000
+        connection.setRequestProperty("Accept", "application/json")
+        connection.setRequestProperty("Authorization", "Bearer $token")
+        if (body != null) {
+            connection.doOutput = true
+            connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+        }
+        try {
+            val code = connection.responseCode
+            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
+            val raw = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: "{}"
+            val result = JSONObject(raw)
+            if (code !in 200..299) throw IllegalStateException(result.optString("error", "HTTP $code"))
+            return result
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun playBrianAudio(bytes: ByteArray, sampleRate: Int) {
+        if (bytes.isEmpty() || sampleRate <= 0) throw IllegalArgumentException("Áudio Brian inválido.")
+        val sampleCount = bytes.size / 2
+        val samples = ShortArray(sampleCount)
+        for (i in 0 until sampleCount) {
+            val low = bytes[i * 2].toInt() and 0xff
+            val high = bytes[i * 2 + 1].toInt()
+            samples[i] = ((high shl 8) or low).toShort()
+        }
+        val minBuffer = AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        if (minBuffer <= 0) throw IllegalStateException("Saída de áudio indisponível.")
+        val track = AudioTrack.Builder()
+            .setAudioAttributes(AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
+            .setAudioFormat(AudioFormat.Builder()
+                .setSampleRate(sampleRate)
+                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .setBufferSizeInBytes(maxOf(minBuffer, 8192))
+            .build()
+        try {
+            track.play()
+            var offset = 0
+            while (offset < samples.size) {
+                val written = track.write(samples, offset, samples.size - offset, AudioTrack.WRITE_BLOCKING)
+                if (written < 0) throw IllegalStateException("Falha na reprodução Brian: $written")
+                if (written == 0) continue
+                offset += written
+            }
+            while (track.playbackHeadPosition < sampleCount) Thread.sleep(25L)
+        } finally {
+            try { track.stop() } catch (_: Exception) {}
+            track.release()
+        }
     }
 
     private fun refreshSessionTimeout() {
