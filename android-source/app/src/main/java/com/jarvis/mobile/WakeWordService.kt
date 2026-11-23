@@ -1,4 +1,4 @@
-﻿package com.jarvis.mobile
+package com.jarvis.mobile
 
 import android.Manifest
 import android.app.Notification
@@ -10,6 +10,8 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
+import android.media.AudioManager
+import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.AudioTrack
@@ -412,13 +414,19 @@ class WakeWordService : Service() {
         val prefixes = listOf("abra ", "abrir ", "abre ", "inicie ", "iniciar ", "execute ", "executar ", "open ", "launch ")
         val prefix = prefixes.firstOrNull { command.startsWith(it) } ?: return false
         var target = command.removePrefix(prefix).trim()
-        target = target.removePrefix("o ").removePrefix("a ").removePrefix("app ").removePrefix("aplicativo ").trim()
+        target = target.replace(Regex("^(o|a|app|aplicativo|aplicação)\\s+"), "").trim()
         if (target.isBlank()) return false
 
-        val knownPackages = when (target) {
-            "google", "pesquisa google", "pesquisa do google" -> listOf("com.google.android.googlequicksearchbox", "com.android.chrome")
-            "youtube", "you tube" -> listOf("com.google.android.youtube")
-            "chrome", "google chrome", "navegador" -> listOf("com.android.chrome")
+        val canonical = when {
+            target in setOf("youtube", "you tube", "yt", "youtube music") -> "YouTube"
+            target in setOf("google", "pesquisa google", "pesquisa do google", "google pesquisa") -> "Google"
+            target in setOf("chrome", "google chrome", "navegador", "internet") -> "Chrome"
+            else -> target
+        }
+        val knownPackages = when (canonical) {
+            "Google" -> listOf("com.google.android.googlequicksearchbox", "com.android.chrome")
+            "YouTube" -> listOf("com.google.android.youtube")
+            "Chrome" -> listOf("com.android.chrome")
             else -> emptyList()
         }
         val packageMatch = knownPackages.firstNotNullOfOrNull { packageName ->
@@ -438,11 +446,17 @@ class WakeWordService : Service() {
         return try {
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             startActivity(intent)
-            updateNotification("Abrindo ${if (target == "google") "Google" else target}")
-            sendState("Abrindo aplicativo: $target")
+            updateNotification("Abrindo $canonical")
+            sendState("Abrindo aplicativo: $canonical")
             true
         } catch (_: Exception) {
-            false
+            val launchPending = PendingIntent.getActivity(
+                this, 1000 + canonical.hashCode(), intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            updateNotification("Toque em Abrir $canonical para concluir o comando", canonical, launchPending)
+            sendState("O Android exige toque na notificação para abrir $canonical")
+            true
         }
     }
 
@@ -488,7 +502,9 @@ class WakeWordService : Service() {
                     val pcm = Base64.decode(encoded, Base64.DEFAULT)
                     playBrianAudio(pcm, voice.optInt("sample_rate", 24000))
                 } catch (voiceError: Exception) {
-                    sendState("Resposta recebida, mas a voz Brian falhou: ${voiceError.message ?: "erro de áudio"}")
+                    val detail = voiceError.message ?: "erro de áudio"
+                    updateNotification("Resposta em texto; falha no áudio Brian: $detail")
+                    sendState("Resposta recebida, mas a voz Brian falhou: $detail")
                 }
             } catch (error: Exception) {
                 val message = error.message ?: "Falha ao processar o comando."
@@ -543,10 +559,27 @@ class WakeWordService : Service() {
         }
         val minBuffer = AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
         if (minBuffer <= 0) throw IllegalStateException("Saída de áudio indisponível.")
+        val audioAttributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build()
+        val audioManager = getSystemService(AudioManager::class.java)
+        val focusRequest = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                .setAudioAttributes(audioAttributes)
+                .setAcceptsDelayedFocusGain(false)
+                .setWillPauseWhenDucked(false)
+                .build()
+        } else null
+        val focusGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            audioManager.requestAudioFocus(focusRequest!!) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.requestAudioFocus(null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        }
+        if (!focusGranted) throw IllegalStateException("Não foi possível obter foco de áudio do Android.")
         val track = AudioTrack.Builder()
-            .setAudioAttributes(AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_ASSISTANT)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
+            .setAudioAttributes(audioAttributes)
             .setAudioFormat(AudioFormat.Builder()
                 .setSampleRate(sampleRate)
                 .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
@@ -567,6 +600,11 @@ class WakeWordService : Service() {
         } finally {
             try { track.stop() } catch (_: Exception) {}
             track.release()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) audioManager.abandonAudioFocusRequest(focusRequest!!)
+            else {
+                @Suppress("DEPRECATION")
+                audioManager.abandonAudioFocus(null)
+            }
         }
     }
 
@@ -604,7 +642,11 @@ class WakeWordService : Service() {
         }
     }
 
-    private fun buildNotification(message: String): Notification {
+    private fun buildNotification(
+        message: String,
+        launchLabel: String? = null,
+        launchPending: PendingIntent? = null
+    ): Notification {
         val openIntent = Intent(this, MainActivity::class.java).addFlags(
             Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         )
@@ -615,20 +657,26 @@ class WakeWordService : Service() {
             this, 2, Intent(this, WakeWordService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-        return Notification.Builder(this, CHANNEL_ID)
+        val builder = Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setContentTitle("J.A.R.V.I.S. â€¢ ativaÃ§Ã£o por voz")
+            .setContentTitle("J.A.R.V.I.S. • ativação por voz")
             .setContentText(message)
             .setStyle(Notification.BigTextStyle().bigText(message))
             .setContentIntent(openPending)
             .setOngoing(true)
-            .addAction(android.R.drawable.ic_media_pause, "Desativar", stopPending)
-            .build()
+        if (launchPending != null && !launchLabel.isNullOrBlank()) {
+            builder.addAction(android.R.drawable.ic_media_play, "Abrir $launchLabel", launchPending)
+        }
+        return builder.addAction(android.R.drawable.ic_media_pause, "Desativar", stopPending).build()
     }
 
-    private fun updateNotification(message: String) {
+    private fun updateNotification(
+        message: String,
+        launchLabel: String? = null,
+        launchPending: PendingIntent? = null
+    ) {
         getSystemService(NotificationManager::class.java)
-            .notify(NOTIFICATION_ID, buildNotification(message))
+            .notify(NOTIFICATION_ID, buildNotification(message, launchLabel, launchPending))
     }
 
     @Suppress("DEPRECATION")
@@ -657,4 +705,5 @@ class WakeWordService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 }
+
 

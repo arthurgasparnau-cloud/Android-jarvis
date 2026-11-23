@@ -11,8 +11,8 @@ android {
         applicationId = "com.jarvis.mobile"
         minSdk = 26
         targetSdk = 35
-        versionCode = 21
-        versionName = "0.3.0"
+        versionCode = 22
+        versionName = "0.3.1"
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
@@ -32,4 +32,5 @@ android {
 dependencies {
     implementation("com.xdcobra.sherpa:sherpa-onnx:2.0.1-1")
 }
+
 
