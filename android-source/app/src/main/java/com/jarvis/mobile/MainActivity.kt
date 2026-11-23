@@ -23,6 +23,8 @@ import android.graphics.Paint
 import android.graphics.RectF
 import android.view.View
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.ColorDrawable
+import android.widget.PopupWindow
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -67,6 +69,7 @@ class MainActivity : Activity() {
     private lateinit var conversationButton: Button
     private lateinit var micButton: Button
     private lateinit var wakeButton: Button
+    private var drawerPopup: PopupWindow? = null
     private var wakeReceiverRegistered = false
     private var pendingWakeStart = false
     private val notificationPermissionRequest = 4104
@@ -249,8 +252,15 @@ class MainActivity : Activity() {
             }
         }
         composer.addView(input, LinearLayout.LayoutParams(0, -2, 1f))
-        micButton = makeButton("◉", false).apply { textSize = 17f; contentDescription = "Falar"; setOnClickListener { startVoiceInput() } }
-        composer.addView(micButton, LinearLayout.LayoutParams(dp(44), dp(44)).apply { marginEnd = dp(5) })
+        micButton = makeButton("🎙", true).apply {
+            textSize = 21f
+            contentDescription = "Falar pelo microfone"
+            background = rounded(cyan, 16)
+            setTextColor(Color.rgb(3, 16, 25))
+            elevation = dp(4).toFloat()
+            setOnClickListener { startVoiceInput() }
+        }
+        composer.addView(micButton, LinearLayout.LayoutParams(dp(52), dp(48)).apply { marginEnd = dp(7) })
         sendButton = makeButton("➤", true).apply { textSize = 18f; contentDescription = "Enviar mensagem"; setOnClickListener { sendMessage() } }
         composer.addView(sendButton, LinearLayout.LayoutParams(dp(44), dp(44)))
         root.addView(composer)
@@ -487,31 +497,87 @@ class MainActivity : Activity() {
     }
 
     private fun showConversationPicker() {
+        if (token.isBlank()) {
+            showConnectionDialog()
+            return
+        }
+        setStatus("Carregando conversas…")
         executor.execute {
             try {
                 val items = request("GET", "/api/conversations", null).optJSONArray("items") ?: JSONArray()
-                val ids = ArrayList<String>()
-                val labels = ArrayList<String>()
-                for (index in 0 until items.length()) {
-                    val item = items.getJSONObject(index)
-                    ids.add(item.optString("id"))
-                    labels.add(item.optString("title", "Conversa ${index + 1}"))
-                }
                 runOnUiThread {
-                    if (labels.isEmpty()) {
-                        setStatus("Nenhuma conversa encontrada.")
-                    } else {
-                        AlertDialog.Builder(this)
-                            .setTitle("Conversas do J.A.R.V.I.S.")
-                            .setItems(labels.toTypedArray()) { _, which ->
-                                conversationId = ids[which]
+                    val drawer = LinearLayout(this).apply {
+                        orientation = LinearLayout.VERTICAL
+                        setPadding(dp(18), dp(24), dp(14), dp(16))
+                        setBackgroundColor(Color.rgb(7, 18, 31))
+                    }
+                    val heading = LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = Gravity.CENTER_VERTICAL
+                    }
+                    val headingText = TextView(this).apply {
+                        text = "CONVERSAS"
+                        textSize = 15f
+                        letterSpacing = 0.14f
+                        typeface = Typeface.DEFAULT_BOLD
+                        setTextColor(cyan)
+                    }
+                    heading.addView(headingText, LinearLayout.LayoutParams(0, dp(44), 1f))
+                    val close = TextView(this).apply {
+                        text = "✕"
+                        textSize = 20f
+                        gravity = Gravity.CENTER
+                        setTextColor(muted)
+                        setPadding(dp(10), dp(6), dp(10), dp(6))
+                    }
+                    heading.addView(close)
+                    drawer.addView(heading)
+                    val divider = View(this).apply { setBackgroundColor(Color.rgb(25, 73, 96)) }
+                    drawer.addView(divider, LinearLayout.LayoutParams(-1, dp(1)).apply { bottomMargin = dp(12) })
+                    val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                    if (items.length() == 0) {
+                        list.addView(TextView(this).apply {
+                            text = "Nenhuma conversa encontrada."
+                            textSize = 14f
+                            setTextColor(muted)
+                            setPadding(dp(8), dp(16), dp(8), dp(16))
+                        })
+                    }
+                    for (index in 0 until items.length()) {
+                        val item = items.getJSONObject(index)
+                        val id = item.optString("id")
+                        val label = item.optString("title", "Conversa ${index + 1}").ifBlank { "Conversa ${index + 1}" }
+                        val selected = id == conversationId
+                        val row = TextView(this).apply {
+                            text = (if (selected) "●  " else "◦  ") + label
+                            textSize = 14f
+                            maxLines = 2
+                            setTextColor(if (selected) cyan else white)
+                            setPadding(dp(12), dp(14), dp(10), dp(14))
+                            background = if (selected) rounded(Color.rgb(13, 48, 67), 12) else rounded(Color.TRANSPARENT, 12)
+                            setOnClickListener {
+                                conversationId = id
                                 prefs.edit().putString("conversation_id", conversationId).apply()
                                 messages.removeAllViews()
                                 loadMessages()
+                                setStatus("Conversa aberta", true)
+                                drawerPopup?.dismiss()
                             }
-                            .setNegativeButton("Fechar", null)
-                            .show()
+                        }
+                        list.addView(row, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(5) })
                     }
+                    val listScroll = ScrollView(this).apply { isFillViewport = false; addView(list) }
+                    drawer.addView(listScroll, LinearLayout.LayoutParams(-1, 0, 1f))
+                    val popup = PopupWindow(drawer, minOf(dp(330), (resources.displayMetrics.widthPixels * 0.86f).toInt()), -1, true).apply {
+                        setBackgroundDrawable(ColorDrawable(Color.rgb(7, 18, 31)))
+                        isOutsideTouchable = true
+                        elevation = dp(18).toFloat()
+                    }
+                    drawerPopup = popup
+                    close.setOnClickListener { popup.dismiss() }
+                    popup.setOnDismissListener { if (drawerPopup === popup) drawerPopup = null }
+                    popup.showAtLocation(root, Gravity.START or Gravity.TOP, 0, 0)
+                    setStatus("Núcleo conectado", true)
                 }
             } catch (error: Exception) {
                 setStatus(friendlyError(error))
