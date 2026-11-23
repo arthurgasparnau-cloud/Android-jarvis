@@ -1,4 +1,4 @@
-plugins {
+﻿plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
@@ -11,8 +11,8 @@ android {
         applicationId = "com.jarvis.mobile"
         minSdk = 26
         targetSdk = 35
-        versionCode = 13
-        versionName = "0.2.2"
+        versionCode = 20
+        versionName = "0.2.9"
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
@@ -32,3 +32,4 @@ android {
 dependencies {
     implementation("com.xdcobra.sherpa:sherpa-onnx:2.0.1-1")
 }
+

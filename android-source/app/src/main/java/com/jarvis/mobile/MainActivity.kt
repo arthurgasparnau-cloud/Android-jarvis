@@ -18,7 +18,10 @@ import java.util.Locale
 import android.app.AlertDialog
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.provider.MediaStore
+import java.io.ByteArrayOutputStream
 import android.graphics.Paint
 import android.graphics.RectF
 import android.view.View
@@ -89,13 +92,18 @@ class MainActivity : Activity() {
                         audioVisualizer.setLevel(intent.getFloatExtra(WakeWordService.EXTRA_AUDIO_LEVEL, 0f))
                     }
                 }
-                WakeWordService.ACTION_WAKE -> setStatus("Hey JARVIS detectado • pode falar", true)
+                WakeWordService.ACTION_WAKE -> startWakeVoiceInput()
                 WakeWordService.ACTION_COMMAND -> {
                     val command = intent.getStringExtra(WakeWordService.EXTRA_COMMAND).orEmpty()
                     prefs.edit().remove("pending_voice_command").apply()
                     if (command.isNotBlank()) {
-                        input.setText(command)
-                        sendMessage()
+                        // Mantém o serviço pausado enquanto o núcleo processa e Brian fala.
+                        sendMessage(command) {
+                            if (prefs.getBoolean("wake_enabled", false)) {
+                                startService(Intent(this@MainActivity, WakeWordService::class.java)
+                                    .setAction(WakeWordService.ACTION_RESUME))
+                            }
+                        }
                     }
                 }
                 WakeWordService.ACTION_STOP_SPEAKING -> {
@@ -110,6 +118,9 @@ class MainActivity : Activity() {
     @Volatile private var brianTrack: AudioTrack? = null
     private val audioPermissionRequest = 4102
     private val speechRequest = 4103
+    private val wakeSpeechRequest = 4106
+    private val cameraRequest = 4105
+    private var wakeSpeechPending = false
 
     private var baseUrl = ""
     private var token = ""
@@ -211,6 +222,11 @@ class MainActivity : Activity() {
             setOnClickListener { toggleWakeWord() }
         }
         hero.addView(wakeButton, LinearLayout.LayoutParams(-1, dp(42)))
+        val cameraButton = makeButton("▣   ANALISAR COM CÂMERA", false).apply {
+            contentDescription = "Tirar foto e pedir análise visual ao JARVIS do PC"
+            setOnClickListener { launchCameraCapture() }
+        }
+        hero.addView(cameraButton, LinearLayout.LayoutParams(-1, dp(40)).apply { topMargin = dp(7) })
         root.addView(hero, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(10) })
 
         val chatHeading = LinearLayout(this).apply {
@@ -783,26 +799,44 @@ class MainActivity : Activity() {
         return true
     }
 
-    private fun sendMessage() {
-        val message = input.text.toString().trim()
-        if (message.isEmpty()) return
+    private fun sendMessage(voiceOrQueuedText: String? = null, onComplete: (() -> Unit)? = null) {
+        val message = (voiceOrQueuedText ?: input.text.toString()).trim()
+        if (message.isEmpty()) {
+            setStatus("Não recebi uma frase para enviar.")
+            onComplete?.invoke()
+            return
+        }
+        if (!sendButton.isEnabled) {
+            setStatus("Já estou processando o comando anterior.")
+            onComplete?.invoke()
+            return
+        }
         if (handleLocalAppCommand(message)) {
             input.setText("")
+            onComplete?.invoke()
             return
         }
         if (token.isBlank() || conversationId.isBlank()) {
             showConnectionDialog()
+            onComplete?.invoke()
             return
         }
         input.setText("")
         addBubble("Você", message, true)
-        setStatus("J.A.R.V.I.S. está pensando…")
+        setStatus("Comando recebido • enviando ao núcleo do PC…", true)
         sendButton.isEnabled = false
         executor.execute {
+            var playbackOwnsCompletion = false
             try {
-                val body = JSONObject().put("message", message).put("conversation_id", conversationId)
+                val body = JSONObject()
+                    .put("message", message)
+                    .put("conversation_id", conversationId)
+                    .put("source", "android_voice_or_chat")
+                setStatus("Comando enviado • aguardando execução do núcleo…", true)
                 val response = request("POST", "/api/chat", null, body)
-                val answer = response.optString("answer", "Não recebi uma resposta textual.")
+                val answer = response.optString("answer", "").ifBlank {
+                    throw IllegalStateException("O núcleo recebeu o comando, mas não retornou resultado.")
+                }
                 runOnUiThread {
                     addBubble("J.A.R.V.I.S.", answer, false)
                     setStatus("Gerando voz Brian…", true)
@@ -812,7 +846,8 @@ class MainActivity : Activity() {
                     val encoded = voiceResponse.optString("audio_base64", "")
                     if (encoded.isBlank()) throw IllegalStateException("O núcleo não retornou áudio Brian.")
                     val pcm = Base64.decode(encoded, Base64.DEFAULT)
-                    playBrianPcm(pcm, voiceResponse.optInt("sample_rate", 24000))
+                    playBrianPcm(pcm, voiceResponse.optInt("sample_rate", 24000)) { onComplete?.invoke() }
+                    playbackOwnsCompletion = true
                     setStatus("Resposta recebida • voz Brian", true)
                 } catch (voiceError: Exception) {
                     setStatus("Resposta recebida • voz Brian indisponível")
@@ -825,11 +860,61 @@ class MainActivity : Activity() {
                 setStatus("Falha na comunicação")
             } finally {
                 runOnUiThread { sendButton.isEnabled = true }
+                if (!playbackOwnsCompletion) onComplete?.invoke()
             }
         }
     }
 
-    private fun playBrianPcm(bytes: ByteArray, sampleRate: Int) {
+    private fun launchCameraCapture() {
+        if (token.isBlank()) {
+            showConnectionDialog()
+            return
+        }
+        try {
+            startActivityForResult(Intent(MediaStore.ACTION_IMAGE_CAPTURE), cameraRequest)
+        } catch (_: Exception) {
+            addBubble("Sistema", "Não encontrei um aplicativo de câmera disponível neste celular.", false)
+        }
+    }
+
+    private fun analyzeCameraImage(bitmap: Bitmap) {
+        setStatus("Preparando imagem para análise…", true)
+        executor.execute {
+            try {
+                val maxSide = 1280
+                val scale = minOf(1f, maxSide.toFloat() / maxOf(bitmap.width, bitmap.height))
+                val resized = if (scale < 1f) Bitmap.createScaledBitmap(
+                    bitmap, (bitmap.width * scale).toInt().coerceAtLeast(1),
+                    (bitmap.height * scale).toInt().coerceAtLeast(1), true
+                ) else bitmap
+                val output = ByteArrayOutputStream()
+                resized.compress(Bitmap.CompressFormat.JPEG, 82, output)
+                if (resized !== bitmap) resized.recycle()
+                val encoded = Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
+                if (encoded.length > 5 * 1024 * 1024) throw IllegalStateException("A imagem ficou maior que o limite de envio.")
+                runOnUiThread { setStatus("Enviando imagem ao núcleo visual do PC…", true) }
+                val body = JSONObject()
+                    .put("image_base64", encoded)
+                    .put("mime_type", "image/jpeg")
+                    .put("prompt", "Analise esta imagem. Descreva o que está visível, leia textos legíveis e destaque detalhes úteis. Separe observações de suposições.")
+                val response = request("POST", "/api/vision", null, body)
+                val answer = response.optString("answer", "Não recebi uma análise da imagem.")
+                runOnUiThread {
+                    addBubble("J.A.R.V.I.S. • VISÃO", answer, false)
+                    setStatus("Análise visual concluída • ${response.optString("model", "núcleo local")}", true)
+                }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    addBubble("Sistema", "Não consegui analisar a imagem: ${error.message ?: "falha desconhecida"}", false)
+                    setStatus("Falha na análise visual")
+                }
+            } finally {
+                if (!bitmap.isRecycled) bitmap.recycle()
+            }
+        }
+    }
+
+    private fun playBrianPcm(bytes: ByteArray, sampleRate: Int, onComplete: (() -> Unit)? = null) {
         if (bytes.isEmpty() || sampleRate <= 0) throw IllegalArgumentException("Áudio PCM inválido.")
         stopBrianPlayback()
         val samples = ShortArray(bytes.size / 2)
@@ -880,6 +965,7 @@ class MainActivity : Activity() {
                 try { track.stop() } catch (_: Exception) {}
                 track.release()
                 if (brianTrack === track) brianTrack = null
+                onComplete?.invoke()
             }
         }, "Jarvis-Brian-Playback").start()
     }
@@ -958,7 +1044,13 @@ class MainActivity : Activity() {
         updateWakeButton()
         mainHandler.removeCallbacks(connectionMonitor)
         mainHandler.post(connectionMonitor)
-        if (prefs.getBoolean("wake_enabled", false)) {
+        if (prefs.getBoolean("wake_detected_pending", false) && !wakeSpeechPending) {
+            mainHandler.postDelayed({
+                if (prefs.getBoolean("wake_detected_pending", false)) startWakeVoiceInput()
+            }, 350L)
+        }
+        if (prefs.getBoolean("wake_enabled", false) && !wakeSpeechPending &&
+            !prefs.getBoolean("wake_detected_pending", false)) {
             if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
                 pendingWakeStart = true
                 requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), audioPermissionRequest)
@@ -973,18 +1065,42 @@ class MainActivity : Activity() {
         val pending = prefs.getString("pending_voice_command", "").orEmpty()
         if (pending.isNotBlank()) {
             prefs.edit().remove("pending_voice_command").apply()
-            input.setText(pending)
-            sendMessage()
+            sendMessage(pending)
         }
     }
 
     override fun onStop() {
+        // O receiver permanece registrado enquanto a Activity existir.
+        // Assim o serviço de voz pode entregar comandos mesmo com outro app na tela.
         mainHandler.removeCallbacks(connectionMonitor)
-        if (wakeReceiverRegistered) {
-            try { unregisterReceiver(wakeReceiver) } catch (_: Exception) {}
-            wakeReceiverRegistered = false
-        }
         super.onStop()
+    }
+
+    private fun startWakeVoiceInput() {
+        if (wakeSpeechPending || !prefs.getBoolean("wake_enabled", false)) return
+        prefs.edit().putBoolean("wake_detected_pending", false).apply()
+        wakeSpeechPending = true
+        setStatus("Hey JARVIS detectado • abrindo reconhecimento Google…", true)
+        try {
+            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, "pt-BR")
+                putExtra(RecognizerIntent.EXTRA_PROMPT, "J.A.R.V.I.S. está ouvindo")
+            }
+            startActivityForResult(intent, wakeSpeechRequest)
+        } catch (_: Exception) {
+            wakeSpeechPending = false
+            setStatus("Não foi possível abrir o reconhecimento Google. Reativando Hey JARVIS…")
+            resumeWakeWordService()
+        }
+    }
+
+    private fun resumeWakeWordService() {
+        if (prefs.getBoolean("wake_enabled", false)) {
+            mainHandler.postDelayed({
+                startService(Intent(this, WakeWordService::class.java).setAction(WakeWordService.ACTION_RESUME))
+            }, 700L)
+        }
     }
 
     private fun startVoiceInput() {
@@ -1028,12 +1144,24 @@ class MainActivity : Activity() {
     @Deprecated("Deprecated in Android API; retained for speech recognizer compatibility")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == speechRequest && resultCode == RESULT_OK) {
-            val spoken = data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull().orEmpty()
+        if (requestCode == wakeSpeechRequest) {
+            wakeSpeechPending = false
+            val spoken = if (resultCode == RESULT_OK) data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull().orEmpty() else ""
             if (spoken.isNotBlank()) {
-                input.setText(spoken)
-                sendMessage()
+                setStatus("Comando reconhecido pelo Google • enviando ao JARVIS…", true)
+                sendMessage(spoken) { resumeWakeWordService() }
+            } else {
+                setStatus("Não captei o comando • voltando a aguardar Hey JARVIS")
+                resumeWakeWordService()
             }
+        } else if (requestCode == speechRequest && resultCode == RESULT_OK) {
+            val spoken = data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull().orEmpty()
+            if (spoken.isNotBlank()) sendMessage(spoken)
+            else setStatus("Não consegui transcrever sua fala. Tente novamente.")
+        } else if (requestCode == cameraRequest && resultCode == RESULT_OK) {
+            val photo = data?.extras?.get("data") as? Bitmap
+            if (photo != null) analyzeCameraImage(photo)
+            else setStatus("A câmera não retornou uma imagem. Tente novamente.")
         }
     }
 
@@ -1047,7 +1175,11 @@ class MainActivity : Activity() {
         val connection = (URL(baseUrl + path).openConnection() as HttpURLConnection)
         connection.requestMethod = method
         connection.connectTimeout = 12000
-        connection.readTimeout = if (path == "/api/chat") 190000 else 20000
+        connection.readTimeout = when (path) {
+            "/api/chat" -> 190000
+            "/api/vision" -> 150000
+            else -> 20000
+        }
         connection.setRequestProperty("Accept", "application/json")
         if (auth && token.isNotBlank()) connection.setRequestProperty("Authorization", "Bearer $token")
         if (body != null) {
@@ -1074,6 +1206,10 @@ class MainActivity : Activity() {
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
     override fun onDestroy() {
+        if (wakeReceiverRegistered) {
+            try { unregisterReceiver(wakeReceiver) } catch (_: Exception) {}
+            wakeReceiverRegistered = false
+        }
         mainHandler.removeCallbacksAndMessages(null)
         executor.shutdownNow()
         textToSpeech?.stop()

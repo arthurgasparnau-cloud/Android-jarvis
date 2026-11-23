@@ -1,4 +1,4 @@
-package com.jarvis.mobile
+﻿package com.jarvis.mobile
 
 import android.Manifest
 import android.app.Notification
@@ -36,6 +36,7 @@ class WakeWordService : Service() {
     companion object {
         const val ACTION_START = "com.jarvis.mobile.WAKE_START"
         const val ACTION_STOP = "com.jarvis.mobile.WAKE_STOP"
+        const val ACTION_RESUME = "com.jarvis.mobile.WAKE_RESUME"
         const val ACTION_STATE = "com.jarvis.mobile.WAKE_STATE"
         const val ACTION_WAKE = "com.jarvis.mobile.WAKE_DETECTED"
         const val ACTION_COMMAND = "com.jarvis.mobile.WAKE_COMMAND"
@@ -59,10 +60,11 @@ class WakeWordService : Service() {
     private var speechRecognizer: SpeechRecognizer? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var commandSessionActive = false
+    private var awaitingCommand = false
     private var lastCommandAt = 0L
 
-    // A conversa não expira por silêncio: o reconhecedor permanece ativo
-    // até um comando explícito de modo silencioso ou desligamento total.
+    // A conversa nÃ£o expira por silÃªncio: o reconhecedor permanece ativo
+    // atÃ© um comando explÃ­cito de modo silencioso ou desligamento total.
     private val sessionTimeout = Runnable { }
 
     override fun onCreate() {
@@ -71,17 +73,18 @@ class WakeWordService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val resumeRequested = intent?.action == ACTION_RESUME
         if (intent?.action == ACTION_STOP) {
             prefs.edit().putBoolean("wake_enabled", false).apply()
             stopSelf()
             return START_NOT_STICKY
         }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            sendState("Microfone sem permissão")
+            sendState("Microfone sem permissÃ£o")
             stopSelf()
             return START_NOT_STICKY
         }
-        val notification = buildNotification("Escuta local ativa • aguardando Hey JARVIS")
+        val notification = buildNotification("Escuta local ativa â€¢ aguardando Hey JARVIS")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
         } else {
@@ -92,20 +95,30 @@ class WakeWordService : Service() {
             wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "JARVIS:WakeWord")
         }
         if (wakeLock?.isHeld != true) wakeLock?.acquire()
-        if (spotter == null && recordingThread == null) {
+        if (resumeRequested) {
+            awaitingCommand = false
+            commandSessionActive = false
+            mainHandler.post { startCommandSession() }
+        } else if (!commandSessionActive) {
+            // Reconhecimento Google contínuo dentro do serviço em primeiro plano.
+            // Não abre Activity: a transcrição e os comandos são tratados em background.
+            startCommandSession()
+        }
+        /*
             thread(name = "JarvisWakeInit") {
                 try {
                     initializeSpotter()
                     startKwsCapture()
                 } catch (error: Exception) {
                     mainHandler.post {
-                        updateNotification("Falha ao iniciar ativação: ${error.message ?: "erro do mecanismo"}")
-                        sendState("Falha ao carregar o modelo de ativação")
+                        updateNotification("Falha ao iniciar ativaÃ§Ã£o: ${error.message ?: "erro do mecanismo"}")
+                        sendState("Falha ao carregar o modelo de ativaÃ§Ã£o")
                         stopSelf()
                     }
                 }
             }
         }
+        */
         return START_STICKY
     }
 
@@ -115,7 +128,7 @@ class WakeWordService : Service() {
         assets.list("wakeword")?.forEach { name ->
             val target = File(modelDir, name)
             // Atualizar sempre o arquivo de palavras-chave em upgrades do APK.
-            // Os modelos ONNX grandes permanecem em cache para evitar cópias desnecessárias.
+            // Os modelos ONNX grandes permanecem em cache para evitar cÃ³pias desnecessÃ¡rias.
             if (name == "keywords.txt" || !target.exists() || target.length() == 0L) {
                 assets.open("wakeword/$name").use { input ->
                     FileOutputStream(target).use { output -> input.copyTo(output) }
@@ -139,7 +152,8 @@ class WakeWordService : Service() {
             maxActivePaths = 4,
             keywordsFile = File(modelDir, "keywords.txt").absolutePath,
             keywordsScore = 1.5f,
-            keywordsThreshold = 0.35f,
+            // Limiar menor para acomodar pronúncias brasileiras e variações de microfone.
+            keywordsThreshold = 0.25f,
             numTrailingBlanks = 1
         )
         spotter = KeywordSpotter(config = config)
@@ -150,7 +164,7 @@ class WakeWordService : Service() {
         val minBytes = AudioRecord.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
-        if (minBytes <= 0) throw IllegalStateException("Microfone indisponível")
+        if (minBytes <= 0) throw IllegalStateException("Microfone indisponÃ­vel")
         val record = AudioRecord(
             MediaRecorder.AudioSource.VOICE_RECOGNITION,
             SAMPLE_RATE,
@@ -160,15 +174,15 @@ class WakeWordService : Service() {
         )
         if (record.state != AudioRecord.STATE_INITIALIZED) {
             record.release()
-            throw IllegalStateException("Não foi possível inicializar o microfone")
+            throw IllegalStateException("NÃ£o foi possÃ­vel inicializar o microfone")
         }
         audioRecord = record
         stream?.release()
         stream = spotter?.createStream()
         recording = true
         record.startRecording()
-        sendState("Modo silencioso • aguardando JARVIS")
-        updateNotification("Modo silencioso • aguardando JARVIS")
+        sendState("Modo silencioso â€¢ aguardando JARVIS")
+        updateNotification("Modo silencioso â€¢ aguardando JARVIS")
         recordingThread = thread(name = "JarvisWakeAudio") {
             val shortBuffer = ShortArray(1600)
             try {
@@ -186,7 +200,7 @@ class WakeWordService : Service() {
                         peak = maxOf(peak, kotlin.math.abs(sample))
                     }
                     val rms = kotlin.math.sqrt(sumSquares / count).toFloat()
-                    // Envia somente o nível do áudio, nunca o conteúdo da fala.
+                    // Envia somente o nÃ­vel do Ã¡udio, nunca o conteÃºdo da fala.
                     sendBroadcast(
                         Intent(ACTION_AUDIO_LEVEL).setPackage(packageName)
                             .putExtra(EXTRA_AUDIO_LEVEL, maxOf(rms, peak * 0.35f))
@@ -223,15 +237,33 @@ class WakeWordService : Service() {
     }
 
     private fun onWakeWordDetected() {
-        updateNotification("JARVIS ativado • pode falar")
+        prefs.edit().putBoolean("wake_detected_pending", true).apply()
+        updateNotification("Hey JARVIS detectado • toque para falar")
         sendBroadcast(Intent(ACTION_WAKE).setPackage(packageName))
-        if (Build.VERSION.SDK_INT < 33 || !SpeechRecognizer.isOnDeviceRecognitionAvailable(this)) {
-            updateNotification("Hey JARVIS detectado • reconhecimento offline de comandos indisponível")
-            sendState("Ativação detectada; ASR offline não disponível neste aparelho")
-            startKwsAgainAfterNotice()
-            return
-        }
-        mainHandler.postDelayed({ startCommandSession() }, 250L)
+        sendState("Hey JARVIS detectado • abra a notificação para falar")
+        // Mantém o detector pausado até o usuário abrir a notificação e concluir o comando.
+        // Isso evita dois reconhecedores disputando o microfone ao retornar ao app.
+    }
+
+    private fun rearmKeywordCapture() {
+        if (!prefs.getBoolean("wake_enabled", true) || spotter == null) return
+        mainHandler.post(object : Runnable {
+            override fun run() {
+                if (!prefs.getBoolean("wake_enabled", true)) return
+                if (recordingThread != null || recording) {
+                    mainHandler.postDelayed(this, 250L)
+                    return
+                }
+                try {
+                    startKwsCapture()
+                    updateNotification("Escuta local ativa • aguardando Hey JARVIS")
+                    sendState("Aguardando Hey JARVIS")
+                } catch (error: Exception) {
+                    updateNotification("Falha ao rearmar escuta: ${error.message ?: "erro"}")
+                    sendState("Falha ao rearmar a escuta Hey JARVIS")
+                }
+            }
+        })
     }
 
     private fun startKwsAgainAfterNotice() {
@@ -247,10 +279,12 @@ class WakeWordService : Service() {
         lastCommandAt = SystemClock.elapsedRealtime()
         try {
             speechRecognizer?.destroy()
-            speechRecognizer = SpeechRecognizer.createOnDeviceSpeechRecognizer(this)
+            // Mesmo serviÃ§o de reconhecimento usado pelo microfone manual do app.
+            // O Android escolhe o mecanismo disponÃ­vel (offline ou online).
+            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
             speechRecognizer?.setRecognitionListener(object : RecognitionListener {
                 override fun onReadyForSpeech(params: android.os.Bundle?) {
-                    updateNotification("JARVIS ouvindo • fale seu comando")
+                    updateNotification("JARVIS ouvindo â€¢ fale seu comando")
                 }
                 override fun onBeginningOfSpeech() {}
                 override fun onRmsChanged(rmsdB: Float) {}
@@ -258,24 +292,40 @@ class WakeWordService : Service() {
                 override fun onEndOfSpeech() {}
                 override fun onError(error: Int) {
                     if (commandSessionActive) {
-                        if (error == SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED ||
-                            error == SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE ||
-                            error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
-                            updateNotification("Reconhecimento offline pt-BR indisponível • verifique os serviços de voz do Android")
-                            sendState("O reconhecimento offline em português não está disponível")
-                            endCommandSession()
-                        } else {
-                            // Erros transitórios e silêncio não encerram a conversa.
-                            mainHandler.postDelayed({ startCommandListening() }, 350L)
-                        }
+                        updateNotification("Reconhecimento Google aguardando • erro $error, tentando novamente")
+                        // Alguns provedores Android deixam a sessão antiga presa após um erro.
+                        // Recria o SpeechRecognizer em vez de insistir no mesmo objeto.
+                        mainHandler.postDelayed({ startCommandSession() }, 900L)
                     }
                 }
                 override fun onResults(results: android.os.Bundle?) {
                     val phrase = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         ?.firstOrNull()?.trim().orEmpty()
-                    if (phrase.isNotBlank()) handleRecognizedCommand(phrase)
-                    if (commandSessionActive) {
-                        mainHandler.postDelayed({ startCommandListening() }, 250L)
+                    val normalized = java.text.Normalizer.normalize(
+                        phrase.lowercase(Locale("pt", "BR")), java.text.Normalizer.Form.NFD
+                    ).replace("\\p{Mn}+".toRegex(), "").replace("[^a-z0-9 ]".toRegex(), " ").trim()
+                    if (normalized.contains("jarvis")) {
+                        val commandAfterWake = phrase.replace(
+                            Regex("(?i)^(hey\\s+)?jarvis[,.\\s]*"), ""
+                        ).trim()
+                        if (commandAfterWake.isNotBlank()) {
+                            awaitingCommand = false
+                            handleRecognizedCommand(commandAfterWake)
+                        } else {
+                            awaitingCommand = true
+                            updateNotification("Hey JARVIS ativado • fale seu comando")
+                            sendState("Hey JARVIS ativado • aguardando comando")
+                            mainHandler.postDelayed({ startCommandSession() }, 350L)
+                        }
+                    } else if (awaitingCommand && phrase.isNotBlank()) {
+                        awaitingCommand = false
+                        handleRecognizedCommand(phrase)
+                        commandSessionActive = false
+                        try { speechRecognizer?.cancel() } catch (_: Exception) {}
+                        speechRecognizer?.destroy()
+                        speechRecognizer = null
+                    } else if (commandSessionActive) {
+                        mainHandler.postDelayed({ startCommandSession() }, 350L)
                     }
                 }
                 override fun onPartialResults(partialResults: android.os.Bundle?) {}
@@ -287,7 +337,7 @@ class WakeWordService : Service() {
             commandSessionActive = false
             speechRecognizer?.destroy()
             speechRecognizer = null
-            startKwsAgainAfterNotice()
+            mainHandler.postDelayed({ startCommandSession() }, 1000L)
         }
     }
 
@@ -297,14 +347,14 @@ class WakeWordService : Service() {
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE, "pt-BR")
-                putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+                putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
                 putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
                 putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1200L)
             }
             speechRecognizer?.startListening(intent)
         } catch (_: Exception) {
-            if (commandSessionActive) mainHandler.postDelayed({ startCommandListening() }, 500L)
+            if (commandSessionActive) mainHandler.postDelayed({ startCommandSession() }, 900L)
         }
     }
 
@@ -334,22 +384,27 @@ class WakeWordService : Service() {
             command == "cale a boca" || command == "pare de falar" || command == "para de falar" ||
             command == "interrompa" || command == "interromper" || command == "stop") {
             sendBroadcast(Intent(ACTION_STOP_SPEAKING).setPackage(packageName))
-            updateNotification("Modo silencioso • aguardando JARVIS")
-            sendState("Modo silencioso • aguardando JARVIS")
+            updateNotification("Modo silencioso â€¢ aguardando JARVIS")
+            sendState("Modo silencioso â€¢ aguardando JARVIS")
             endCommandSession()
             return
         }
 
+        commandSessionActive = false
+        try { speechRecognizer?.cancel() } catch (_: Exception) {}
+        speechRecognizer?.destroy()
+        speechRecognizer = null
         prefs.edit().putString("pending_voice_command", phrase).apply()
         sendBroadcast(
             Intent(ACTION_COMMAND).setPackage(packageName).putExtra(EXTRA_COMMAND, phrase)
         )
-        updateNotification("Comando reconhecido • conversa ativa")
+        updateNotification("Comando reconhecido â€¢ processando no núcleo")
+        sendState("Comando reconhecido â€¢ enviando ao núcleo")
         lastCommandAt = SystemClock.elapsedRealtime()
     }
 
     private fun refreshSessionTimeout() {
-        // Mantido como ponto de compatibilidade; não encerra a conversa por silêncio.
+        // Mantido como ponto de compatibilidade; nÃ£o encerra a conversa por silÃªncio.
         mainHandler.removeCallbacks(sessionTimeout)
     }
 
@@ -359,12 +414,10 @@ class WakeWordService : Service() {
         try { speechRecognizer?.stopListening() } catch (_: Exception) {}
         speechRecognizer?.destroy()
         speechRecognizer = null
+        awaitingCommand = false
         if (prefs.getBoolean("wake_enabled", true)) {
-            try {
-                startKwsCapture()
-            } catch (error: Exception) {
-                updateNotification("Não foi possível rearmar a escuta: ${error.message ?: "erro"}")
-            }
+            updateNotification("Google ouvindo • aguardando Hey JARVIS")
+            mainHandler.postDelayed({ startCommandSession() }, 500L)
         }
     }
 
@@ -375,9 +428,9 @@ class WakeWordService : Service() {
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
-                CHANNEL_ID, "Ativação Hey JARVIS", NotificationManager.IMPORTANCE_LOW
+                CHANNEL_ID, "AtivaÃ§Ã£o Hey JARVIS", NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Indica quando a ativação por voz está habilitada"
+                description = "Indica quando a ativaÃ§Ã£o por voz estÃ¡ habilitada"
                 setShowBadge(false)
             }
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
@@ -397,7 +450,7 @@ class WakeWordService : Service() {
         )
         return Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setContentTitle("J.A.R.V.I.S. • ativação por voz")
+            .setContentTitle("J.A.R.V.I.S. â€¢ ativaÃ§Ã£o por voz")
             .setContentText(message)
             .setStyle(Notification.BigTextStyle().bigText(message))
             .setContentIntent(openPending)
@@ -413,8 +466,8 @@ class WakeWordService : Service() {
 
     @Suppress("DEPRECATION")
     override fun onDestroy() {
-        // Não apagar a preferência em encerramentos inesperados do processo.
-        // O comando explícito ACTION_STOP ou "desligar sistema" já grava false.
+        // NÃ£o apagar a preferÃªncia em encerramentos inesperados do processo.
+        // O comando explÃ­cito ACTION_STOP ou "desligar sistema" jÃ¡ grava false.
         recording = false
         try { audioRecord?.stop() } catch (_: Exception) {}
         try { audioRecord?.release() } catch (_: Exception) {}
@@ -437,3 +490,4 @@ class WakeWordService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 }
+
