@@ -20,6 +20,8 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
 import android.view.inputmethod.EditorInfo
 import android.widget.Button
@@ -41,6 +43,15 @@ class MainActivity : Activity() {
     private val white = Color.rgb(229, 244, 250)
     private val muted = Color.rgb(128, 164, 181)
     private val executor = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    @Volatile private var coreConnected = false
+    @Volatile private var connectionCheckRunning = false
+    private val connectionMonitor = object : Runnable {
+        override fun run() {
+            checkCoreConnection()
+            mainHandler.postDelayed(this, 30000L)
+        }
+    }
     private val prefs by lazy { getSharedPreferences("jarvis_mobile", MODE_PRIVATE) }
 
     private lateinit var root: LinearLayout
@@ -324,9 +335,32 @@ class MainActivity : Activity() {
                 }
                 prefs.edit().putString("conversation_id", conversationId).apply()
                 loadMessages()
+                coreConnected = true
                 setStatus("Núcleo conectado", true)
             } catch (error: Exception) {
-                setStatus(friendlyError(error))
+                coreConnected = false
+                setStatus(if (token.isBlank()) "Sessão expirada. Reconecte pelo menu ⋮." else friendlyError(error))
+            }
+        }
+    }
+
+    private fun checkCoreConnection() {
+        if (token.isBlank() || connectionCheckRunning) return
+        connectionCheckRunning = true
+        executor.execute {
+            try {
+                request("GET", "/api/health", null)
+                if (!coreConnected) {
+                    coreConnected = true
+                    setStatus("Conexão com o núcleo restabelecida", true)
+                    loadConversations()
+                }
+            } catch (error: Exception) {
+                if (coreConnected) setStatus("Conexão com o PC perdida. Tentando reconectar…")
+                coreConnected = false
+                if (token.isBlank()) setStatus("Sessão expirada. Reconecte pelo menu ⋮.")
+            } finally {
+                connectionCheckRunning = false
             }
         }
     }
@@ -650,6 +684,8 @@ class MainActivity : Activity() {
             wakeReceiverRegistered = true
         }
         updateWakeButton()
+        mainHandler.removeCallbacks(connectionMonitor)
+        mainHandler.post(connectionMonitor)
         if (prefs.getBoolean("wake_enabled", false)) {
             val serviceIntent = Intent(this, WakeWordService::class.java).setAction(WakeWordService.ACTION_START)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(serviceIntent)
@@ -668,6 +704,7 @@ class MainActivity : Activity() {
     }
 
     override fun onStop() {
+        mainHandler.removeCallbacks(connectionMonitor)
         if (wakeReceiverRegistered) {
             try { unregisterReceiver(wakeReceiver) } catch (_: Exception) {}
             wakeReceiverRegistered = false
@@ -762,6 +799,7 @@ class MainActivity : Activity() {
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
     override fun onDestroy() {
+        mainHandler.removeCallbacksAndMessages(null)
         executor.shutdownNow()
         textToSpeech?.stop()
         stopBrianPlayback()
