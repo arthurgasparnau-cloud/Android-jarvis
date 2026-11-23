@@ -18,6 +18,10 @@ import java.util.Locale
 import android.app.AlertDialog
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.RectF
+import android.view.View
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.os.Handler
@@ -122,49 +126,104 @@ class MainActivity : Activity() {
     }
 
     private fun buildUi() {
+        window.statusBarColor = Color.rgb(4, 10, 18)
+        window.navigationBarColor = Color.rgb(4, 10, 18)
         root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(18), dp(16), dp(12))
-            setBackgroundColor(navy)
+            setPadding(dp(16), dp(12), dp(16), dp(10))
+            setBackgroundColor(Color.rgb(4, 10, 18))
         }
+
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(8))
+        }
+        val brand = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_VERTICAL
         }
         val title = TextView(this).apply {
             text = "J.A.R.V.I.S."
-            textSize = 23f
-            letterSpacing = 0.16f
+            textSize = 21f
+            letterSpacing = 0.18f
             setTextColor(cyan)
-            typeface = Typeface.DEFAULT_BOLD
+            typeface = Typeface.create("sans-serif", Typeface.BOLD)
         }
-        header.addView(title, LinearLayout.LayoutParams(0, dp(42), 1f))
-        conversationButton = makeButton("CONVERSAS", false).apply { setOnClickListener { showConversationPicker() } }
-        header.addView(conversationButton)
-        val newButton = makeButton("NOVA", false).apply { setOnClickListener { newConversation() } }
-        header.addView(newButton)
-        val settings = makeButton("⋮", false).apply { setOnClickListener { showConnectionDialog() } }
-        header.addView(settings)
+        val subtitle = TextView(this).apply {
+            text = "PERSONAL AI SYSTEM"
+            textSize = 8f
+            letterSpacing = 0.22f
+            setTextColor(muted)
+        }
+        brand.addView(title)
+        brand.addView(subtitle)
+        header.addView(brand, LinearLayout.LayoutParams(0, dp(48), 1f))
+        conversationButton = makeButton("☷", false).apply { contentDescription = "Conversas"; setOnClickListener { showConversationPicker() } }
+        header.addView(conversationButton, LinearLayout.LayoutParams(dp(44), dp(42)).apply { marginEnd = dp(6) })
+        val newButton = makeButton("+", false).apply { textSize = 20f; contentDescription = "Nova conversa"; setOnClickListener { newConversation() } }
+        header.addView(newButton, LinearLayout.LayoutParams(dp(44), dp(42)).apply { marginEnd = dp(6) })
+        val settings = makeButton("⋮", false).apply { textSize = 20f; contentDescription = "Configurações"; setOnClickListener { showConnectionDialog() } }
+        header.addView(settings, LinearLayout.LayoutParams(dp(42), dp(42)))
         root.addView(header)
 
+        val hero = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(14), dp(10), dp(14), dp(12))
+            background = outlined(Color.rgb(8, 22, 36), Color.rgb(20, 74, 99), 24)
+        }
+        hero.addView(ArcReactorView(this), LinearLayout.LayoutParams(dp(116), dp(116)).apply { bottomMargin = dp(4) })
+        val systemLabel = TextView(this).apply {
+            text = "SISTEMA J.A.R.V.I.S."
+            textSize = 10f
+            letterSpacing = 0.2f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(cyan)
+            gravity = Gravity.CENTER
+        }
+        hero.addView(systemLabel)
         status = TextView(this).apply {
-            text = "NÚCLEO DESCONECTADO"
-            textSize = 11f
+            text = "AGUARDANDO CONEXÃO"
+            textSize = 10f
             letterSpacing = 0.08f
             setTextColor(muted)
-            setPadding(0, dp(4), 0, dp(12))
+            gravity = Gravity.CENTER
+            setPadding(0, dp(5), 0, dp(9))
         }
-        root.addView(status)
-
-        wakeButton = makeButton("HEY JARVIS: OFF", false).apply {
+        hero.addView(status)
+        wakeButton = makeButton("◉   ATIVAR HEY JARVIS", true).apply {
             setOnClickListener { toggleWakeWord() }
         }
-        root.addView(wakeButton, LinearLayout.LayoutParams(-1, dp(42)).apply { bottomMargin = dp(8) })
+        hero.addView(wakeButton, LinearLayout.LayoutParams(-1, dp(42)))
+        root.addView(hero, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(10) })
+
+        val chatHeading = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val chatTitle = TextView(this).apply {
+            text = "CONVERSA"
+            textSize = 10f
+            letterSpacing = 0.18f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(muted)
+        }
+        chatHeading.addView(chatTitle, LinearLayout.LayoutParams(0, dp(28), 1f))
+        val live = TextView(this).apply {
+            text = "●  LIVE"
+            textSize = 9f
+            letterSpacing = 0.1f
+            setTextColor(Color.rgb(68, 205, 151))
+        }
+        chatHeading.addView(live)
+        root.addView(chatHeading)
 
         scroll = ScrollView(this).apply {
             isFillViewport = true
             clipToPadding = false
-            setPadding(0, dp(4), 0, dp(8))
+            overScrollMode = View.OVER_SCROLL_NEVER
+            setPadding(0, dp(2), 0, dp(6))
         }
         messages = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         scroll.addView(messages)
@@ -173,27 +232,27 @@ class MainActivity : Activity() {
         val composer = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(8), 0, 0)
+            setPadding(dp(8), dp(7), dp(8), dp(7))
+            background = outlined(Color.rgb(8, 20, 32), Color.rgb(22, 62, 82), 20)
         }
         input = EditText(this).apply {
-            hint = "Mensagem para o JARVIS…"
+            hint = "Fale com o JARVIS..."
             setHintTextColor(muted)
             setTextColor(white)
-            textSize = 16f
+            textSize = 15f
             maxLines = 4
-            setPadding(dp(14), dp(12), dp(14), dp(12))
-            background = rounded(panel, 18)
+            setPadding(dp(9), dp(10), dp(8), dp(10))
+            background = null
             imeOptions = EditorInfo.IME_ACTION_SEND
             setOnEditorActionListener { _, action, _ ->
                 if (action == EditorInfo.IME_ACTION_SEND) { sendMessage(); true } else false
             }
         }
         composer.addView(input, LinearLayout.LayoutParams(0, -2, 1f))
-        micButton = makeButton("MIC", false).apply { setOnClickListener { startVoiceInput() } }
-        composer.addView(micButton, LinearLayout.LayoutParams(-2, dp(48)).apply { marginEnd = dp(6) })
-        sendButton = makeButton("ENVIAR", true).apply { setOnClickListener { sendMessage() } }
-        val sendParams = LinearLayout.LayoutParams(-2, dp(48)).apply { marginStart = dp(6) }
-        composer.addView(sendButton, sendParams)
+        micButton = makeButton("◉", false).apply { textSize = 17f; contentDescription = "Falar"; setOnClickListener { startVoiceInput() } }
+        composer.addView(micButton, LinearLayout.LayoutParams(dp(44), dp(44)).apply { marginEnd = dp(5) })
+        sendButton = makeButton("➤", true).apply { textSize = 18f; contentDescription = "Enviar mensagem"; setOnClickListener { sendMessage() } }
+        composer.addView(sendButton, LinearLayout.LayoutParams(dp(44), dp(44)))
         root.addView(composer)
         setContentView(root)
         showWelcome()
@@ -208,7 +267,7 @@ class MainActivity : Activity() {
         textSize = 11f
         isAllCaps = false
         setTextColor(if (primary) Color.rgb(3, 16, 25) else cyan)
-        background = rounded(if (primary) cyan else panel, 14)
+        background = if (primary) rounded(cyan, 14) else outlined(panel, Color.rgb(27, 78, 101), 14)
         minWidth = 0
         minimumWidth = 0
         setPadding(dp(12), 0, dp(12), 0)
@@ -216,6 +275,68 @@ class MainActivity : Activity() {
 
     private fun rounded(color: Int, radius: Int): GradientDrawable =
         GradientDrawable().apply { setColor(color); cornerRadius = dp(radius).toFloat() }
+
+    private fun outlined(color: Int, stroke: Int, radius: Int): GradientDrawable =
+        GradientDrawable().apply {
+            setColor(color)
+            cornerRadius = dp(radius).toFloat()
+            setStroke(dp(1), stroke)
+        }
+
+    private inner class ArcReactorView(context: Context) : View(context) {
+        private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+        }
+        private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        private val bounds = RectF()
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val cx = width / 2f
+            val cy = height / 2f
+            val radius = minOf(width, height) * 0.43f
+            fillPaint.color = Color.rgb(5, 28, 45)
+            canvas.drawCircle(cx, cy, radius * 1.12f, fillPaint)
+
+            ringPaint.color = Color.argb(38, 73, 218, 255)
+            ringPaint.strokeWidth = dp(1).toFloat()
+            canvas.drawCircle(cx, cy, radius * 1.08f, ringPaint)
+            ringPaint.color = Color.rgb(23, 105, 139)
+            ringPaint.strokeWidth = dp(2).toFloat()
+            canvas.drawCircle(cx, cy, radius * 0.92f, ringPaint)
+
+            bounds.set(cx - radius * 0.78f, cy - radius * 0.78f, cx + radius * 0.78f, cy + radius * 0.78f)
+            ringPaint.color = cyan
+            ringPaint.strokeWidth = dp(3).toFloat()
+            canvas.drawArc(bounds, -218f, 285f, false, ringPaint)
+
+            ringPaint.color = Color.rgb(35, 133, 166)
+            ringPaint.strokeWidth = dp(2).toFloat()
+            bounds.inset(radius * 0.17f, radius * 0.17f)
+            canvas.drawArc(bounds, 28f, 300f, false, ringPaint)
+
+            ringPaint.color = Color.argb(150, 73, 218, 255)
+            ringPaint.strokeWidth = dp(1).toFloat()
+            for (i in 0 until 12) {
+                val angle = Math.toRadians((i * 30.0) - 90.0)
+                val inner = radius * 0.62f
+                val outer = radius * 0.72f
+                canvas.drawLine(
+                    cx + kotlin.math.cos(angle).toFloat() * inner,
+                    cy + kotlin.math.sin(angle).toFloat() * inner,
+                    cx + kotlin.math.cos(angle).toFloat() * outer,
+                    cy + kotlin.math.sin(angle).toFloat() * outer,
+                    ringPaint
+                )
+            }
+
+            fillPaint.color = Color.rgb(73, 218, 255)
+            canvas.drawCircle(cx, cy, radius * 0.25f, fillPaint)
+            fillPaint.color = Color.rgb(190, 247, 255)
+            canvas.drawCircle(cx, cy, radius * 0.12f, fillPaint)
+        }
+    }
 
     private fun addBubble(author: String, text: String, mine: Boolean) {
         val wrap = LinearLayout(this).apply {
@@ -226,7 +347,7 @@ class MainActivity : Activity() {
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(14), dp(10), dp(14), dp(10))
-            background = rounded(if (mine) Color.rgb(13, 54, 72) else panel, 16)
+            background = if (mine) outlined(Color.rgb(10, 43, 59), Color.rgb(29, 111, 143), 16) else outlined(Color.rgb(9, 22, 35), Color.rgb(25, 57, 75), 16)
         }
         val label = TextView(this).apply {
             this.text = author.uppercase()
@@ -665,9 +786,9 @@ class MainActivity : Activity() {
     private fun updateWakeButton() {
         if (!::wakeButton.isInitialized) return
         val enabled = prefs.getBoolean("wake_enabled", false)
-        wakeButton.text = if (enabled) "HEY JARVIS: ON" else "HEY JARVIS: OFF"
+        wakeButton.text = if (enabled) "◉   HEY JARVIS ATIVO" else "◉   ATIVAR HEY JARVIS"
         wakeButton.setTextColor(if (enabled) Color.rgb(3, 16, 25) else cyan)
-        wakeButton.background = rounded(if (enabled) cyan else panel, 14)
+        wakeButton.background = if (enabled) rounded(cyan, 14) else outlined(panel, Color.rgb(27, 78, 101), 14)
     }
 
     override fun onStart() {
