@@ -80,7 +80,7 @@ class MainActivity : Activity() {
             when (intent?.action) {
                 WakeWordService.ACTION_STATE -> {
                     val state = intent.getStringExtra(WakeWordService.EXTRA_STATE).orEmpty()
-                    setStatus(state, state.contains("ativado", true) || state.contains("ouvindo", true))
+                    setStatus(state, state.contains("ativado", true) || state.contains("ouvindo", true) || state.contains("aguardando", true))
                     updateWakeButton()
                 }
                 WakeWordService.ACTION_WAKE -> setStatus("Hey JARVIS detectado • pode falar", true)
@@ -905,13 +905,24 @@ class MainActivity : Activity() {
             else registerReceiver(wakeReceiver, filter)
             wakeReceiverRegistered = true
         }
+        // Primeira inicialização: deixar a detecção local em espera por padrão.
+        // O usuário ainda pode desligar tudo pelo comando de voz ou pelo botão.
+        if (!prefs.getBoolean("wake_default_initialized", false)) {
+            prefs.edit()
+                .putBoolean("wake_default_initialized", true)
+                .putBoolean("wake_enabled", true)
+                .apply()
+        }
         updateWakeButton()
         mainHandler.removeCallbacks(connectionMonitor)
         mainHandler.post(connectionMonitor)
         if (prefs.getBoolean("wake_enabled", false)) {
-            val serviceIntent = Intent(this, WakeWordService::class.java).setAction(WakeWordService.ACTION_START)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(serviceIntent)
-            else startService(serviceIntent)
+            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                pendingWakeStart = true
+                requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), audioPermissionRequest)
+            } else {
+                requestNotificationPermissionOrStartWakeWord()
+            }
         }
     }
 

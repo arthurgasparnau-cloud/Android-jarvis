@@ -59,11 +59,9 @@ class WakeWordService : Service() {
     private var commandSessionActive = false
     private var lastCommandAt = 0L
 
-    private val sessionTimeout = Runnable {
-        if (commandSessionActive && SystemClock.elapsedRealtime() - lastCommandAt >= 15000L) {
-            endCommandSession()
-        }
-    }
+    // A conversa não expira por silêncio: o reconhecedor permanece ativo
+    // até um comando explícito de modo silencioso ou desligamento total.
+    private val sessionTimeout = Runnable { }
 
     override fun onCreate() {
         super.onCreate()
@@ -106,7 +104,7 @@ class WakeWordService : Service() {
                 }
             }
         }
-        return START_NOT_STICKY
+        return START_STICKY
     }
 
     private fun initializeSpotter() {
@@ -165,8 +163,8 @@ class WakeWordService : Service() {
         stream = spotter?.createStream()
         recording = true
         record.startRecording()
-        sendState("Hey JARVIS ativado")
-        updateNotification("Escuta local ativa • aguardando Hey JARVIS")
+        sendState("Modo silencioso • aguardando JARVIS")
+        updateNotification("Modo silencioso • aguardando JARVIS")
         recordingThread = thread(name = "JarvisWakeAudio") {
             val shortBuffer = ShortArray(1600)
             try {
@@ -249,9 +247,8 @@ class WakeWordService : Service() {
                             updateNotification("Reconhecimento offline pt-BR indisponível • verifique os serviços de voz do Android")
                             sendState("O reconhecimento offline em português não está disponível")
                             endCommandSession()
-                        } else if (SystemClock.elapsedRealtime() - lastCommandAt >= 15000L) {
-                            endCommandSession()
                         } else {
+                            // Erros transitórios e silêncio não encerram a conversa.
                             mainHandler.postDelayed({ startCommandListening() }, 350L)
                         }
                     }
@@ -298,31 +295,45 @@ class WakeWordService : Service() {
         val normalized = java.text.Normalizer.normalize(
             phrase.lowercase(Locale("pt", "BR")), java.text.Normalizer.Form.NFD
         ).replace("\\p{Mn}+".toRegex(), "")
-        if (normalized.contains("desligue hey jarvis") || normalized.contains("desativar hey jarvis") ||
-            normalized.contains("desative hey jarvis")) {
+            .replace("[^a-z0-9 ]".toRegex(), " ")
+            .trim()
+            .replace("\\s+".toRegex(), " ")
+        val command = normalized.removePrefix("hey jarvis ").removePrefix("jarvis ").trim()
+
+        if (command == "desligar sistema" || command == "desligue sistema" ||
+            command == "desliga sistema" || command == "encerrar sistema de voz") {
+            sendBroadcast(Intent(ACTION_STOP_SPEAKING).setPackage(packageName))
             prefs.edit().putBoolean("wake_enabled", false).apply()
-            sendState("Hey JARVIS desligado")
+            commandSessionActive = false
+            sendState("Monitoramento por voz desligado")
+            updateNotification("Monitoramento por voz desligado")
             stopSelf()
             return
         }
-        if (normalized.contains("cale a boca") || normalized == "pare" || normalized == "chega" ||
-            normalized.contains("pare de falar")) {
+
+        if (command == "desligar" || command == "desliga" || command == "desligue" ||
+            command == "parar" || command == "pare" || command == "para" ||
+            command == "chega" || command == "silencio" || command == "cala a boca" ||
+            command == "cale a boca" || command == "pare de falar" || command == "para de falar" ||
+            command == "interrompa" || command == "interromper" || command == "stop") {
             sendBroadcast(Intent(ACTION_STOP_SPEAKING).setPackage(packageName))
-            updateNotification("JARVIS interrompido • continuo ouvindo")
-        } else {
-            prefs.edit().putString("pending_voice_command", phrase).apply()
-            sendBroadcast(
-                Intent(ACTION_COMMAND).setPackage(packageName).putExtra(EXTRA_COMMAND, phrase)
-            )
-            updateNotification("Comando reconhecido • JARVIS pronto")
+            updateNotification("Modo silencioso • aguardando JARVIS")
+            sendState("Modo silencioso • aguardando JARVIS")
+            endCommandSession()
+            return
         }
+
+        prefs.edit().putString("pending_voice_command", phrase).apply()
+        sendBroadcast(
+            Intent(ACTION_COMMAND).setPackage(packageName).putExtra(EXTRA_COMMAND, phrase)
+        )
+        updateNotification("Comando reconhecido • conversa ativa")
         lastCommandAt = SystemClock.elapsedRealtime()
-        refreshSessionTimeout()
     }
 
     private fun refreshSessionTimeout() {
+        // Mantido como ponto de compatibilidade; não encerra a conversa por silêncio.
         mainHandler.removeCallbacks(sessionTimeout)
-        mainHandler.postDelayed(sessionTimeout, 15000L)
     }
 
     private fun endCommandSession() {
@@ -385,7 +396,8 @@ class WakeWordService : Service() {
 
     @Suppress("DEPRECATION")
     override fun onDestroy() {
-        prefs.edit().putBoolean("wake_enabled", false).apply()
+        // Não apagar a preferência em encerramentos inesperados do processo.
+        // O comando explícito ACTION_STOP ou "desligar sistema" já grava false.
         recording = false
         try { audioRecord?.stop() } catch (_: Exception) {}
         try { audioRecord?.release() } catch (_: Exception) {}
