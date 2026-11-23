@@ -112,7 +112,9 @@ class WakeWordService : Service() {
         if (!modelDir.exists()) modelDir.mkdirs()
         assets.list("wakeword")?.forEach { name ->
             val target = File(modelDir, name)
-            if (!target.exists() || target.length() == 0L) {
+            // Atualizar sempre o arquivo de palavras-chave em upgrades do APK.
+            // Os modelos ONNX grandes permanecem em cache para evitar cópias desnecessárias.
+            if (name == "keywords.txt" || !target.exists() || target.length() == 0L) {
                 assets.open("wakeword/$name").use { input ->
                     FileOutputStream(target).use { output -> input.copyTo(output) }
                 }
