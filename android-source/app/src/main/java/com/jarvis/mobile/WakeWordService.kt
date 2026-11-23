@@ -542,30 +542,43 @@ class WakeWordService : Service() {
 
     private fun coreRequest(baseUrl: String, token: String, method: String, path: String, body: JSONObject? = null): JSONObject {
         val connection = (URL(baseUrl.trimEnd('/') + path).openConnection() as HttpURLConnection)
-        connection.requestMethod = method
-        connection.connectTimeout = 15000
-        connection.readTimeout = if (path == "/api/chat") 190000 else 30000
-        connection.setRequestProperty("Accept", "application/json")
-        connection.setRequestProperty("Authorization", "Bearer $token")
-        if (body != null) {
-            connection.doOutput = true
-            connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-        }
         try {
+            connection.requestMethod = method
+            connection.connectTimeout = 12000
+            connection.readTimeout = if (path == "/api/chat") 180000 else 25000
+            connection.useCaches = false
+            connection.setRequestProperty("Accept", "application/json")
+            connection.setRequestProperty("Authorization", "Bearer $token")
+            if (body != null) {
+                connection.doOutput = true
+                connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+            }
+
             val code = connection.responseCode
-            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
-            val raw = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: "{}"
-            val result = JSONObject(raw)
-            if (code !in 200..299) throw IllegalStateException(result.optString("error", "HTTP $code"))
-            return result
+            val responseStream = if (code in 200..299) connection.inputStream else connection.errorStream
+            val raw = responseStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+            if (code !in 200..299) {
+                val detail = try {
+                    JSONObject(raw).optString("error").ifBlank { JSONObject(raw).optString("detail") }
+                } catch (_: Exception) { "" }
+                throw IllegalStateException(detail.ifBlank { "Falha HTTP $code em $path" })
+            }
+            if (raw.isBlank()) return JSONObject()
+            return try {
+                JSONObject(raw)
+            } catch (_: Exception) {
+                throw IllegalStateException("Resposta inválida do núcleo em $path.")
+            }
         } finally {
             connection.disconnect()
         }
     }
 
     private fun playBrianAudio(bytes: ByteArray, sampleRate: Int) {
-        if (bytes.isEmpty() || sampleRate <= 0) throw IllegalArgumentException("Áudio Brian inválido.")
+        if (bytes.isEmpty() || bytes.size % 2 != 0 || sampleRate !in 8000..96000) {
+            throw IllegalArgumentException("Áudio Brian inválido ou em formato incompatível.")
+        }
         val sampleCount = bytes.size / 2
         val samples = ShortArray(sampleCount)
         for (i in 0 until sampleCount) {
@@ -594,28 +607,39 @@ class WakeWordService : Service() {
             audioManager.requestAudioFocus(null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
         }
         if (!focusGranted) throw IllegalStateException("Não foi possível obter foco de áudio do Android.")
-        val track = AudioTrack.Builder()
-            .setAudioAttributes(audioAttributes)
-            .setAudioFormat(AudioFormat.Builder()
-                .setSampleRate(sampleRate)
-                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
-            .setTransferMode(AudioTrack.MODE_STREAM)
-            .setBufferSizeInBytes(maxOf(minBuffer, 8192))
-            .build()
+        var track: AudioTrack? = null
         try {
+            track = AudioTrack.Builder()
+                .setAudioAttributes(audioAttributes)
+                .setAudioFormat(AudioFormat.Builder()
+                    .setSampleRate(sampleRate)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .setBufferSizeInBytes(maxOf(minBuffer, 8192))
+                .build()
+            if (track.state != AudioTrack.STATE_INITIALIZED) {
+                throw IllegalStateException("O Android não conseguiu inicializar a saída de áudio.")
+            }
             track.play()
             var offset = 0
+            var zeroWrites = 0
             while (offset < samples.size) {
                 val written = track.write(samples, offset, samples.size - offset, AudioTrack.WRITE_BLOCKING)
                 if (written < 0) throw IllegalStateException("Falha na reprodução Brian: $written")
-                if (written == 0) continue
+                if (written == 0) {
+                    zeroWrites++
+                    if (zeroWrites > 50) throw IllegalStateException("A saída de áudio não está aceitando dados.")
+                    Thread.sleep(10L)
+                    continue
+                }
+                zeroWrites = 0
                 offset += written
             }
             while (track.playbackHeadPosition < sampleCount) Thread.sleep(25L)
         } finally {
-            try { track.stop() } catch (_: Exception) {}
-            track.release()
+            try { track?.stop() } catch (_: Exception) {}
+            try { track?.release() } catch (_: Exception) {}
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) audioManager.abandonAudioFocusRequest(focusRequest!!)
             else {
                 @Suppress("DEPRECATION")
