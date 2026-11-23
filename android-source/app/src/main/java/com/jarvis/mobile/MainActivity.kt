@@ -1,0 +1,772 @@
+package com.jarvis.mobile
+
+import android.app.Activity
+import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
+import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioTrack
+import android.util.Base64
+import android.speech.RecognizerIntent
+import android.speech.tts.TextToSpeech
+import java.util.Locale
+import android.app.AlertDialog
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.os.Bundle
+import android.view.Gravity
+import android.view.inputmethod.EditorInfo
+import android.widget.Button
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import org.json.JSONArray
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+import java.util.concurrent.Executors
+
+class MainActivity : Activity() {
+    private val navy = Color.rgb(5, 12, 22)
+    private val panel = Color.rgb(11, 25, 40)
+    private val cyan = Color.rgb(73, 218, 255)
+    private val white = Color.rgb(229, 244, 250)
+    private val muted = Color.rgb(128, 164, 181)
+    private val executor = Executors.newSingleThreadExecutor()
+    private val prefs by lazy { getSharedPreferences("jarvis_mobile", MODE_PRIVATE) }
+
+    private lateinit var root: LinearLayout
+    private lateinit var messages: LinearLayout
+    private lateinit var scroll: ScrollView
+    private lateinit var status: TextView
+    private lateinit var input: EditText
+    private lateinit var sendButton: Button
+    private lateinit var conversationButton: Button
+    private lateinit var micButton: Button
+    private lateinit var wakeButton: Button
+    private var wakeReceiverRegistered = false
+    private var pendingWakeStart = false
+    private val notificationPermissionRequest = 4104
+    private val wakeReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                WakeWordService.ACTION_STATE -> {
+                    val state = intent.getStringExtra(WakeWordService.EXTRA_STATE).orEmpty()
+                    setStatus(state, state.contains("ativado", true) || state.contains("ouvindo", true))
+                    updateWakeButton()
+                }
+                WakeWordService.ACTION_WAKE -> setStatus("Hey JARVIS detectado • pode falar", true)
+                WakeWordService.ACTION_COMMAND -> {
+                    val command = intent.getStringExtra(WakeWordService.EXTRA_COMMAND).orEmpty()
+                    prefs.edit().remove("pending_voice_command").apply()
+                    if (command.isNotBlank()) {
+                        input.setText(command)
+                        sendMessage()
+                    }
+                }
+                WakeWordService.ACTION_STOP_SPEAKING -> {
+                    textToSpeech?.stop()
+                    stopBrianPlayback()
+                }
+            }
+        }
+    }
+    private var textToSpeech: TextToSpeech? = null
+    private var ttsReady = false
+    @Volatile private var brianTrack: AudioTrack? = null
+    private val audioPermissionRequest = 4102
+    private val speechRequest = 4103
+
+    private var baseUrl = ""
+    private var token = ""
+    private var conversationId = ""
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        baseUrl = prefs.getString("base_url", "https://arthur.tail25244c.ts.net") ?: "https://arthur.tail25244c.ts.net"
+        token = prefs.getString("token", "") ?: ""
+        buildUi()
+        textToSpeech = TextToSpeech(this) { result ->
+            if (result == TextToSpeech.SUCCESS) {
+                val languageResult = textToSpeech?.setLanguage(Locale("pt", "BR"))
+                ttsReady = languageResult != TextToSpeech.LANG_MISSING_DATA && languageResult != TextToSpeech.LANG_NOT_SUPPORTED
+            }
+        }
+        conversationId = prefs.getString("conversation_id", "") ?: ""
+        if (baseUrl.isNotBlank() && token.isNotBlank()) {
+            setStatus("Conectando ao núcleo J.A.R.V.I.S.…")
+            loadConversations()
+        } else {
+            setStatus("PRIMEIRA CONEXÃO PENDENTE • MENU ⋮")
+            addBubble("Sistema", "Para conectar pela primeira vez, abra o menu ⋮ e informe o PIN do JARVIS Viewer. Depois disso, a conexão será automática.", false)
+        }
+    }
+
+    private fun buildUi() {
+        root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(18), dp(16), dp(12))
+            setBackgroundColor(navy)
+        }
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val title = TextView(this).apply {
+            text = "J.A.R.V.I.S."
+            textSize = 23f
+            letterSpacing = 0.16f
+            setTextColor(cyan)
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        header.addView(title, LinearLayout.LayoutParams(0, dp(42), 1f))
+        conversationButton = makeButton("CONVERSAS", false).apply { setOnClickListener { showConversationPicker() } }
+        header.addView(conversationButton)
+        val newButton = makeButton("NOVA", false).apply { setOnClickListener { newConversation() } }
+        header.addView(newButton)
+        val settings = makeButton("⋮", false).apply { setOnClickListener { showConnectionDialog() } }
+        header.addView(settings)
+        root.addView(header)
+
+        status = TextView(this).apply {
+            text = "NÚCLEO DESCONECTADO"
+            textSize = 11f
+            letterSpacing = 0.08f
+            setTextColor(muted)
+            setPadding(0, dp(4), 0, dp(12))
+        }
+        root.addView(status)
+
+        wakeButton = makeButton("HEY JARVIS: OFF", false).apply {
+            setOnClickListener { toggleWakeWord() }
+        }
+        root.addView(wakeButton, LinearLayout.LayoutParams(-1, dp(42)).apply { bottomMargin = dp(8) })
+
+        scroll = ScrollView(this).apply {
+            isFillViewport = true
+            clipToPadding = false
+            setPadding(0, dp(4), 0, dp(8))
+        }
+        messages = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        scroll.addView(messages)
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+
+        val composer = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, 0)
+        }
+        input = EditText(this).apply {
+            hint = "Mensagem para o JARVIS…"
+            setHintTextColor(muted)
+            setTextColor(white)
+            textSize = 16f
+            maxLines = 4
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = rounded(panel, 18)
+            imeOptions = EditorInfo.IME_ACTION_SEND
+            setOnEditorActionListener { _, action, _ ->
+                if (action == EditorInfo.IME_ACTION_SEND) { sendMessage(); true } else false
+            }
+        }
+        composer.addView(input, LinearLayout.LayoutParams(0, -2, 1f))
+        micButton = makeButton("MIC", false).apply { setOnClickListener { startVoiceInput() } }
+        composer.addView(micButton, LinearLayout.LayoutParams(-2, dp(48)).apply { marginEnd = dp(6) })
+        sendButton = makeButton("ENVIAR", true).apply { setOnClickListener { sendMessage() } }
+        val sendParams = LinearLayout.LayoutParams(-2, dp(48)).apply { marginStart = dp(6) }
+        composer.addView(sendButton, sendParams)
+        root.addView(composer)
+        setContentView(root)
+        showWelcome()
+    }
+
+    private fun showWelcome() {
+        addBubble("J.A.R.V.I.S.", "Olá. Estou pronto para me conectar ao núcleo central.", false)
+    }
+
+    private fun makeButton(label: String, primary: Boolean): Button = Button(this).apply {
+        text = label
+        textSize = 11f
+        isAllCaps = false
+        setTextColor(if (primary) Color.rgb(3, 16, 25) else cyan)
+        background = rounded(if (primary) cyan else panel, 14)
+        minWidth = 0
+        minimumWidth = 0
+        setPadding(dp(12), 0, dp(12), 0)
+    }
+
+    private fun rounded(color: Int, radius: Int): GradientDrawable =
+        GradientDrawable().apply { setColor(color); cornerRadius = dp(radius).toFloat() }
+
+    private fun addBubble(author: String, text: String, mine: Boolean) {
+        val wrap = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = if (mine) Gravity.END else Gravity.START
+            setPadding(0, dp(5), 0, dp(5))
+        }
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+            background = rounded(if (mine) Color.rgb(13, 54, 72) else panel, 16)
+        }
+        val label = TextView(this).apply {
+            this.text = author.uppercase()
+            textSize = 10f
+            letterSpacing = 0.08f
+            setTextColor(cyan)
+        }
+        val body = TextView(this).apply {
+            this.text = text
+            textSize = 15f
+            setTextColor(white)
+            setPadding(0, dp(4), 0, 0)
+        }
+        card.addView(label)
+        card.addView(body)
+        wrap.addView(card, LinearLayout.LayoutParams(-2, -2).apply { width = (resources.displayMetrics.widthPixels * 0.82f).toInt() })
+        messages.addView(wrap)
+        scroll.post { scroll.fullScroll(ScrollView.FOCUS_DOWN) }
+    }
+
+    private fun friendlyError(error: Exception): String {
+        var cause: Throwable? = error
+        while (cause != null) {
+            if (cause is java.net.UnknownHostException) return "Tailscale não encontrado. Ative o Tailscale no celular e entre na mesma conta do PC."
+            if (cause is java.net.ConnectException) return "Não foi possível alcançar o PC. Verifique se ele está ligado e com o JARVIS aberto."
+            if (cause is java.net.SocketTimeoutException) return "Tempo esgotado. Verifique a conexão Tailscale e tente novamente."
+            cause = cause.cause
+        }
+        return error.message ?: "Falha na conexão com o núcleo J.A.R.V.I.S."
+    }
+
+    private fun setStatus(value: String, good: Boolean = false) {
+        runOnUiThread {
+            status.text = value.uppercase()
+            status.setTextColor(if (good) cyan else muted)
+        }
+    }
+
+    private fun showConnectionDialog() {
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), 0)
+        }
+        val host = EditText(this).apply {
+            hint = "https://arthur.tail25244c.ts.net"
+            setSingleLine(true)
+            setText(baseUrl)
+        }
+        val pin = EditText(this).apply {
+            hint = "PIN de 6 dígitos do JARVIS Viewer"
+            inputType = 2
+            setSingleLine(true)
+        }
+        layout.addView(TextView(this).apply { text = "Endereço HTTPS do PC"; setTextColor(white) })
+        layout.addView(host)
+        layout.addView(TextView(this).apply { text = "PIN de acesso"; setTextColor(white); setPadding(0, dp(12), 0, 0) })
+        layout.addView(pin)
+        AlertDialog.Builder(this)
+            .setTitle("Conectar ao J.A.R.V.I.S.")
+            .setMessage("O PC precisa estar ligado, com o JARVIS aberto e o acesso remoto privado configurado.")
+            .setView(layout)
+            .setNegativeButton("Cancelar", null)
+            .setPositiveButton("Conectar") { _, _ ->
+                val enteredHost = host.text.toString().trim().trimEnd('/')
+                val enteredPin = pin.text.toString().trim()
+                if (!enteredHost.startsWith("https://") || enteredPin.length != 6) {
+                    setStatus("Informe um endereço HTTPS e um PIN válido.")
+                } else {
+                    baseUrl = enteredHost
+                    authenticate(enteredPin)
+                }
+            }
+            .show()
+    }
+
+    private fun authenticate(pin: String) {
+        setStatus("Autenticando conexão…")
+        executor.execute {
+            try {
+                val response = request("POST", "/api/auth", null, JSONObject().put("pin", pin), auth = false)
+                token = response.getString("token")
+                prefs.edit().putString("base_url", baseUrl).putString("token", token).apply()
+                runOnUiThread { messages.removeAllViews() }
+                setStatus("Conectado ao núcleo central", true)
+                loadConversations()
+            } catch (error: Exception) {
+                token = ""
+                prefs.edit().remove("token").apply()
+                setStatus(friendlyError(error))
+            }
+        }
+    }
+
+    private fun loadConversations() {
+        executor.execute {
+            try {
+                val response = request("GET", "/api/conversations", null)
+                val list = response.optJSONArray("items") ?: response.optJSONArray("conversations")
+                val firstId = if (list != null && list.length() > 0) {
+                    list.getJSONObject(0).optString("id")
+                } else ""
+                if (conversationId.isBlank()) conversationId = firstId
+                if (conversationId.isBlank()) {
+                    val created = request("POST", "/api/conversations", null, JSONObject())
+                    conversationId = created.optString("id")
+                }
+                prefs.edit().putString("conversation_id", conversationId).apply()
+                loadMessages()
+                setStatus("Núcleo conectado", true)
+            } catch (error: Exception) {
+                setStatus(friendlyError(error))
+            }
+        }
+    }
+
+    private fun showConversationPicker() {
+        executor.execute {
+            try {
+                val items = request("GET", "/api/conversations", null).optJSONArray("items") ?: JSONArray()
+                val ids = ArrayList<String>()
+                val labels = ArrayList<String>()
+                for (index in 0 until items.length()) {
+                    val item = items.getJSONObject(index)
+                    ids.add(item.optString("id"))
+                    labels.add(item.optString("title", "Conversa ${index + 1}"))
+                }
+                runOnUiThread {
+                    if (labels.isEmpty()) {
+                        setStatus("Nenhuma conversa encontrada.")
+                    } else {
+                        AlertDialog.Builder(this)
+                            .setTitle("Conversas do J.A.R.V.I.S.")
+                            .setItems(labels.toTypedArray()) { _, which ->
+                                conversationId = ids[which]
+                                prefs.edit().putString("conversation_id", conversationId).apply()
+                                messages.removeAllViews()
+                                loadMessages()
+                            }
+                            .setNegativeButton("Fechar", null)
+                            .show()
+                    }
+                }
+            } catch (error: Exception) {
+                setStatus(friendlyError(error))
+            }
+        }
+    }
+
+    private fun newConversation() {
+        executor.execute {
+            try {
+                val created = request("POST", "/api/conversations", null, JSONObject())
+                conversationId = created.optString("id")
+                prefs.edit().putString("conversation_id", conversationId).apply()
+                runOnUiThread {
+                    messages.removeAllViews()
+                    addBubble("J.A.R.V.I.S.", "Nova conversa iniciada.", false)
+                    setStatus("Nova conversa pronta", true)
+                }
+            } catch (error: Exception) {
+                setStatus(friendlyError(error))
+            }
+        }
+    }
+
+    private fun loadMessages() {
+        val id = conversationId
+        if (id.isBlank()) return
+        executor.execute {
+            try {
+                val path = "/api/messages?conversation_id=" + URLEncoder.encode(id, "UTF-8")
+                val response = request("GET", path, null)
+                runOnUiThread {
+                    messages.removeAllViews()
+                    val rows = response.optJSONArray("items") ?: JSONArray()
+                    for (index in 0 until rows.length()) {
+                        val item = rows.getJSONObject(index)
+                        val author = item.optString("author", "assistant")
+                        addBubble(if (author == "user") "Você" else "J.A.R.V.I.S.", item.optString("message"), author == "user")
+                    }
+                }
+            } catch (error: Exception) {
+                setStatus(friendlyError(error))
+            }
+        }
+    }
+
+    private fun normalizeCommand(value: String): String =
+        java.text.Normalizer.normalize(value.lowercase(Locale("pt", "BR")), java.text.Normalizer.Form.NFD)
+            .replace("\\p{Mn}+".toRegex(), "")
+            .replace("[^a-z0-9 ]".toRegex(), " ")
+            .trim()
+            .replace("\\s+".toRegex(), " ")
+
+    private fun getLaunchableApps(): List<Pair<String, String>> {
+        val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        return packageManager.queryIntentActivities(launcherIntent, 0)
+            .mapNotNull { info ->
+                val label = info.loadLabel(packageManager)?.toString()?.trim().orEmpty()
+                val packageName = info.activityInfo?.packageName.orEmpty()
+                if (label.isBlank() || packageName.isBlank()) null else label to packageName
+            }
+            .distinctBy { it.second }
+            .sortedBy { it.first.lowercase(Locale("pt", "BR")) }
+    }
+
+    private fun handleLocalAppCommand(message: String): Boolean {
+        val command = normalizeCommand(message)
+        val listRequests = listOf("listar aplicativos", "listar apps", "quais aplicativos", "quais apps", "apps instalados", "aplicativos instalados")
+        if (listRequests.any { command.contains(it) }) {
+            val apps = getLaunchableApps()
+            val visible = apps.take(35).joinToString(", ") { it.first }
+            val suffix = if (apps.size > 35) "\\nE mais ${apps.size - 35} aplicativos." else ""
+            addBubble("J.A.R.V.I.S.", if (apps.isEmpty()) "Não encontrei aplicativos disponíveis para abrir." else "Aplicativos disponíveis (${apps.size}):\\n$visible$suffix", false)
+            setStatus("Lista de aplicativos atualizada", true)
+            return true
+        }
+
+        val closePrefixes = listOf("feche ", "fechar ", "encerre ", "encerrar ", "sair do ", "saia do ")
+        val homeRequests = listOf("volte para a tela inicial", "ir para tela inicial", "voltar para tela inicial", "volte ao inicio", "voltar ao inicio")
+        if (closePrefixes.any { command.startsWith(it) } || homeRequests.any { command.contains(it) }) {
+            addBubble("J.A.R.V.I.S.", "Voltando à tela inicial. O Android não permite que um app comum force a parada de outro aplicativo; ele continuará em segundo plano.", false)
+            setStatus("Retornando à tela inicial", true)
+            window.decorView.post {
+                val home = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                try {
+                    startActivity(home)
+                } catch (_: Exception) {
+                    setStatus("Não foi possível abrir a tela inicial.")
+                }
+            }
+            return true
+        }
+
+        val openPrefixes = listOf("abra ", "abrir ", "abre ", "inicie ", "iniciar ", "execute ", "executar ", "open ", "launch ")
+        val prefix = openPrefixes.firstOrNull { command.startsWith(it) } ?: return false
+        var target = command.removePrefix(prefix).trim()
+        target = target.removePrefix("o ").removePrefix("a ").removePrefix("app ").removePrefix("aplicativo ").trim()
+        if (target.isBlank()) return false
+
+        val apps = getLaunchableApps()
+        val match = apps.firstOrNull { normalizeCommand(it.first) == target }
+            ?: apps.firstOrNull {
+                val label = normalizeCommand(it.first)
+                label.contains(target) || target.contains(label)
+            }
+        if (match == null) {
+            addBubble("J.A.R.V.I.S.", "Não encontrei um aplicativo chamado ‘$target’. Você pode dizer ‘listar aplicativos’ para ver os nomes disponíveis.", false)
+            setStatus("Aplicativo não encontrado")
+            return true
+        }
+
+        val launchIntent = packageManager.getLaunchIntentForPackage(match.second)
+        if (launchIntent == null) {
+            addBubble("J.A.R.V.I.S.", "Encontrei ${match.first}, mas o Android não disponibilizou uma ação de abertura para ele.", false)
+            setStatus("Não foi possível abrir o aplicativo")
+            return true
+        }
+        try {
+            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(launchIntent)
+            addBubble("J.A.R.V.I.S.", "Abrindo ${match.first}.", false)
+            setStatus("Aplicativo aberto: ${match.first}", true)
+        } catch (error: Exception) {
+            addBubble("Sistema", "Falha ao abrir ${match.first}: ${error.message ?: "erro desconhecido"}", false)
+            setStatus("Falha ao abrir aplicativo")
+        }
+        return true
+    }
+
+    private fun sendMessage() {
+        val message = input.text.toString().trim()
+        if (message.isEmpty()) return
+        if (handleLocalAppCommand(message)) {
+            input.setText("")
+            return
+        }
+        if (token.isBlank() || conversationId.isBlank()) {
+            showConnectionDialog()
+            return
+        }
+        input.setText("")
+        addBubble("Você", message, true)
+        setStatus("J.A.R.V.I.S. está pensando…")
+        sendButton.isEnabled = false
+        executor.execute {
+            try {
+                val body = JSONObject().put("message", message).put("conversation_id", conversationId)
+                val response = request("POST", "/api/chat", null, body)
+                val answer = response.optString("answer", "Não recebi uma resposta textual.")
+                runOnUiThread {
+                    addBubble("J.A.R.V.I.S.", answer, false)
+                    setStatus("Gerando voz Brian…", true)
+                }
+                try {
+                    val voiceResponse = request("POST", "/api/tts", null, JSONObject().put("text", answer))
+                    val encoded = voiceResponse.optString("audio_base64", "")
+                    if (encoded.isBlank()) throw IllegalStateException("O núcleo não retornou áudio Brian.")
+                    val pcm = Base64.decode(encoded, Base64.DEFAULT)
+                    playBrianPcm(pcm, voiceResponse.optInt("sample_rate", 24000))
+                    setStatus("Resposta recebida • voz Brian", true)
+                } catch (voiceError: Exception) {
+                    setStatus("Resposta recebida • voz Brian indisponível")
+                    runOnUiThread {
+                        addBubble("Sistema", "Não consegui gerar a voz Brian: ${voiceError.message ?: "falha de áudio"}. A chave permanece protegida no PC; não troquei para outra voz.", false)
+                    }
+                }
+            } catch (error: Exception) {
+                runOnUiThread { addBubble("Sistema", error.message ?: "Falha ao enviar mensagem.", false) }
+                setStatus("Falha na comunicação")
+            } finally {
+                runOnUiThread { sendButton.isEnabled = true }
+            }
+        }
+    }
+
+    private fun playBrianPcm(bytes: ByteArray, sampleRate: Int) {
+        if (bytes.isEmpty() || sampleRate <= 0) throw IllegalArgumentException("Áudio PCM inválido.")
+        stopBrianPlayback()
+        val samples = ShortArray(bytes.size / 2)
+        for (i in samples.indices) {
+            val lo = bytes[i * 2].toInt() and 0xff
+            val hi = bytes[i * 2 + 1].toInt()
+            samples[i] = ((hi shl 8) or lo).toShort()
+        }
+        val minBuffer = AudioTrack.getMinBufferSize(
+            sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (minBuffer <= 0) throw IllegalStateException("Saída de áudio indisponível.")
+        val track = AudioTrack.Builder()
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setSampleRate(sampleRate)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .build()
+            )
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .setBufferSizeInBytes(maxOf(minBuffer, 8192))
+            .build()
+        brianTrack = track
+        Thread({
+            try {
+                track.play()
+                var offset = 0
+                while (offset < samples.size && brianTrack === track) {
+                    val written = track.write(samples, offset, samples.size - offset, AudioTrack.WRITE_BLOCKING)
+                    if (written < 0) throw IllegalStateException("Falha ao reproduzir áudio Brian: $written")
+                    offset += written
+                }
+                while (brianTrack === track && track.playbackHeadPosition < samples.size) {
+                    Thread.sleep(20)
+                }
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            } catch (error: Exception) {
+                runOnUiThread { setStatus("Falha na reprodução da voz Brian") }
+            } finally {
+                try { track.stop() } catch (_: Exception) {}
+                track.release()
+                if (brianTrack === track) brianTrack = null
+            }
+        }, "Jarvis-Brian-Playback").start()
+    }
+
+    private fun stopBrianPlayback() {
+        val track = brianTrack
+        brianTrack = null
+        if (track != null) {
+            try { track.pause() } catch (_: Exception) {}
+            try { track.flush() } catch (_: Exception) {}
+            try { track.stop() } catch (_: Exception) {}
+            try { track.release() } catch (_: Exception) {}
+        }
+    }
+
+    private fun toggleWakeWord() {
+        if (prefs.getBoolean("wake_enabled", false)) {
+            prefs.edit().putBoolean("wake_enabled", false).apply()
+            startService(Intent(this, WakeWordService::class.java).setAction(WakeWordService.ACTION_STOP))
+            updateWakeButton()
+            setStatus("Ativação Hey JARVIS desligada")
+            return
+        }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            pendingWakeStart = true
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), audioPermissionRequest)
+            return
+        }
+        requestNotificationPermissionOrStartWakeWord()
+    }
+
+    private fun requestNotificationPermissionOrStartWakeWord() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), notificationPermissionRequest)
+            return
+        }
+        prefs.edit().putBoolean("wake_enabled", true).apply()
+        val serviceIntent = Intent(this, WakeWordService::class.java).setAction(WakeWordService.ACTION_START)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(serviceIntent)
+        else startService(serviceIntent)
+        updateWakeButton()
+        setStatus("Iniciando ativação local Hey JARVIS…")
+    }
+
+    private fun updateWakeButton() {
+        if (!::wakeButton.isInitialized) return
+        val enabled = prefs.getBoolean("wake_enabled", false)
+        wakeButton.text = if (enabled) "HEY JARVIS: ON" else "HEY JARVIS: OFF"
+        wakeButton.setTextColor(if (enabled) Color.rgb(3, 16, 25) else cyan)
+        wakeButton.background = rounded(if (enabled) cyan else panel, 14)
+    }
+
+    override fun onStart() {
+        super.onStart()
+        if (!wakeReceiverRegistered) {
+            val filter = IntentFilter().apply {
+                addAction(WakeWordService.ACTION_STATE)
+                addAction(WakeWordService.ACTION_WAKE)
+                addAction(WakeWordService.ACTION_COMMAND)
+                addAction(WakeWordService.ACTION_STOP_SPEAKING)
+            }
+            if (Build.VERSION.SDK_INT >= 33) registerReceiver(wakeReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            else registerReceiver(wakeReceiver, filter)
+            wakeReceiverRegistered = true
+        }
+        updateWakeButton()
+        if (prefs.getBoolean("wake_enabled", false)) {
+            val serviceIntent = Intent(this, WakeWordService::class.java).setAction(WakeWordService.ACTION_START)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(serviceIntent)
+            else startService(serviceIntent)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        val pending = prefs.getString("pending_voice_command", "").orEmpty()
+        if (pending.isNotBlank()) {
+            prefs.edit().remove("pending_voice_command").apply()
+            input.setText(pending)
+            sendMessage()
+        }
+    }
+
+    override fun onStop() {
+        if (wakeReceiverRegistered) {
+            try { unregisterReceiver(wakeReceiver) } catch (_: Exception) {}
+            wakeReceiverRegistered = false
+        }
+        super.onStop()
+    }
+
+    private fun startVoiceInput() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), audioPermissionRequest)
+            return
+        }
+        try {
+            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, "pt-BR")
+                putExtra(RecognizerIntent.EXTRA_PROMPT, "Fale com o J.A.R.V.I.S.")
+            }
+            startActivityForResult(intent, speechRequest)
+        } catch (_: Exception) {
+            setStatus("Reconhecimento de voz indisponível neste celular.")
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == audioPermissionRequest && grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+            if (pendingWakeStart) {
+                pendingWakeStart = false
+                requestNotificationPermissionOrStartWakeWord()
+            } else {
+                startVoiceInput()
+            }
+        } else if (requestCode == audioPermissionRequest) {
+            pendingWakeStart = false
+            setStatus("Permissão do microfone negada.")
+        } else if (requestCode == notificationPermissionRequest) {
+            if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+                requestNotificationPermissionOrStartWakeWord()
+            } else {
+                setStatus("Permita notificações para manter o indicador da escuta contínua.")
+            }
+        }
+    }
+
+    @Deprecated("Deprecated in Android API; retained for speech recognizer compatibility")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == speechRequest && resultCode == RESULT_OK) {
+            val spoken = data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull().orEmpty()
+            if (spoken.isNotBlank()) {
+                input.setText(spoken)
+                sendMessage()
+            }
+        }
+    }
+
+    private fun request(
+        method: String,
+        path: String,
+        unused: String? = null,
+        body: JSONObject? = null,
+        auth: Boolean = true
+    ): JSONObject {
+        val connection = (URL(baseUrl + path).openConnection() as HttpURLConnection)
+        connection.requestMethod = method
+        connection.connectTimeout = 12000
+        connection.readTimeout = if (path == "/api/chat") 190000 else 20000
+        connection.setRequestProperty("Accept", "application/json")
+        if (auth && token.isNotBlank()) connection.setRequestProperty("Authorization", "Bearer $token")
+        if (body != null) {
+            connection.doOutput = true
+            connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+        }
+        try {
+            val code = connection.responseCode
+            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
+            val text = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: "{}"
+            val result = JSONObject(text)
+            if (code == 401 && auth) {
+                token = ""
+                prefs.edit().remove("token").apply()
+            }
+            if (code !in 200..299) throw IllegalStateException(result.optString("error", "HTTP $code"))
+            return result
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    override fun onDestroy() {
+        executor.shutdownNow()
+        textToSpeech?.stop()
+        stopBrianPlayback()
+        textToSpeech?.shutdown()
+        textToSpeech = null
+        super.onDestroy()
+    }
+}
