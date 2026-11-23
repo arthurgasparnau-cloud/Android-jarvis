@@ -39,6 +39,8 @@ class WakeWordService : Service() {
         const val ACTION_STATE = "com.jarvis.mobile.WAKE_STATE"
         const val ACTION_WAKE = "com.jarvis.mobile.WAKE_DETECTED"
         const val ACTION_COMMAND = "com.jarvis.mobile.WAKE_COMMAND"
+        const val ACTION_AUDIO_LEVEL = "com.jarvis.mobile.WAKE_AUDIO_LEVEL"
+        const val EXTRA_AUDIO_LEVEL = "audio_level"
         const val ACTION_STOP_SPEAKING = "com.jarvis.mobile.STOP_SPEAKING"
         const val EXTRA_COMMAND = "command"
         const val EXTRA_STATE = "state"
@@ -176,6 +178,19 @@ class WakeWordService : Service() {
                         if (!recording) break
                         continue
                     }
+                    var sumSquares = 0.0
+                    var peak = 0f
+                    for (i in 0 until count) {
+                        val sample = shortBuffer[i] / 32768.0f
+                        sumSquares += sample * sample
+                        peak = maxOf(peak, kotlin.math.abs(sample))
+                    }
+                    val rms = kotlin.math.sqrt(sumSquares / count).toFloat()
+                    // Envia somente o nível do áudio, nunca o conteúdo da fala.
+                    sendBroadcast(
+                        Intent(ACTION_AUDIO_LEVEL).setPackage(packageName)
+                            .putExtra(EXTRA_AUDIO_LEVEL, maxOf(rms, peak * 0.35f))
+                    )
                     val samples = FloatArray(count) { shortBuffer[it] / 32768.0f }
                     val currentStream = stream ?: break
                     val currentSpotter = spotter ?: break

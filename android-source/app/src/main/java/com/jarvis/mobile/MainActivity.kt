@@ -65,6 +65,7 @@ class MainActivity : Activity() {
     private lateinit var messages: LinearLayout
     private lateinit var scroll: ScrollView
     private lateinit var status: TextView
+    private lateinit var audioVisualizer: AudioVisualizerView
     private lateinit var input: EditText
     private lateinit var sendButton: Button
     private lateinit var conversationButton: Button
@@ -82,6 +83,11 @@ class MainActivity : Activity() {
                     val state = intent.getStringExtra(WakeWordService.EXTRA_STATE).orEmpty()
                     setStatus(state, state.contains("ativado", true) || state.contains("ouvindo", true) || state.contains("aguardando", true))
                     updateWakeButton()
+                }
+                WakeWordService.ACTION_AUDIO_LEVEL -> {
+                    if (::audioVisualizer.isInitialized) {
+                        audioVisualizer.setLevel(intent.getFloatExtra(WakeWordService.EXTRA_AUDIO_LEVEL, 0f))
+                    }
                 }
                 WakeWordService.ACTION_WAKE -> setStatus("Hey JARVIS detectado • pode falar", true)
                 WakeWordService.ACTION_COMMAND -> {
@@ -197,6 +203,10 @@ class MainActivity : Activity() {
             setPadding(0, dp(5), 0, dp(9))
         }
         hero.addView(status)
+        audioVisualizer = AudioVisualizerView(this)
+        hero.addView(audioVisualizer, LinearLayout.LayoutParams(-1, dp(34)).apply {
+            bottomMargin = dp(7)
+        })
         wakeButton = makeButton("◉   ATIVAR HEY JARVIS", true).apply {
             setOnClickListener { toggleWakeWord() }
         }
@@ -294,6 +304,37 @@ class MainActivity : Activity() {
             cornerRadius = dp(radius).toFloat()
             setStroke(dp(1), stroke)
         }
+
+    private inner class AudioVisualizerView(context: Context) : View(context) {
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = cyan
+            strokeCap = Paint.Cap.ROUND
+            strokeWidth = dp(3).toFloat()
+        }
+        @Volatile private var level = 0f
+
+        fun setLevel(value: Float) {
+            level = value.coerceIn(0f, 1f)
+            postInvalidateOnAnimation()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val count = 31
+            val centerY = height / 2f
+            val step = width.toFloat() / count
+            val maxHeight = height * 0.43f
+            for (i in 0 until count) {
+                val position = kotlin.math.abs(i - count / 2).toFloat() / (count / 2f)
+                val envelope = 1f - position * 0.58f
+                val ripple = 0.35f + 0.65f * kotlin.math.abs(kotlin.math.sin(i * 1.71f))
+                val amplitude = (maxHeight * (0.08f + level * 2.2f * envelope * ripple)).coerceAtMost(maxHeight)
+                paint.alpha = (95 + level * 160).toInt().coerceIn(95, 255)
+                val x = step * (i + 0.5f)
+                canvas.drawLine(x, centerY - amplitude, x, centerY + amplitude, paint)
+            }
+        }
+    }
 
     private inner class ArcReactorView(context: Context) : View(context) {
         private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -897,6 +938,7 @@ class MainActivity : Activity() {
         if (!wakeReceiverRegistered) {
             val filter = IntentFilter().apply {
                 addAction(WakeWordService.ACTION_STATE)
+                addAction(WakeWordService.ACTION_AUDIO_LEVEL)
                 addAction(WakeWordService.ACTION_WAKE)
                 addAction(WakeWordService.ACTION_COMMAND)
                 addAction(WakeWordService.ACTION_STOP_SPEAKING)
