@@ -73,6 +73,8 @@ class WakeWordService : Service() {
     private var awaitingCommand = false
     @Volatile private var processingCommand = false
     private var lastCommandAt = 0L
+    private var notificationActionLabel: String? = null
+    private var notificationActionPending: PendingIntent? = null
 
     // A conversa nÃ£o expira por silÃªncio: o reconhecedor permanece ativo
     // atÃ© um comando explÃ­cito de modo silencioso ou desligamento total.
@@ -403,7 +405,7 @@ class WakeWordService : Service() {
         speechRecognizer = null
         awaitingCommand = false
         lastCommandAt = SystemClock.elapsedRealtime()
-        if (tryLaunchPhoneApp(command)) {
+        if (tryNavigateHome(command) || tryLaunchPhoneApp(command)) {
             mainHandler.postDelayed({ startCommandSession() }, 700L)
             return
         }
@@ -443,21 +445,35 @@ class WakeWordService : Service() {
             packageManager.getLaunchIntentForPackage(match.activityInfo.packageName) ?: return false
         }
 
-        return try {
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            startActivity(intent)
-            updateNotification("Abrindo $canonical")
-            sendState("Abrindo aplicativo: $canonical")
-            true
-        } catch (_: Exception) {
-            val launchPending = PendingIntent.getActivity(
-                this, 1000 + canonical.hashCode(), intent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
-            updateNotification("Toque em Abrir $canonical para concluir o comando", canonical, launchPending)
-            sendState("O Android exige toque na notificação para abrir $canonical")
-            true
-        }
+        // Android bloqueia iniciar Activities a partir de serviços em segundo plano em vários cenários.
+        // Não depender de uma exceção: oferecer sempre uma ação explícita na notificação persistente.
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        notificationActionLabel = "Abrir $canonical"
+        notificationActionPending = PendingIntent.getActivity(
+            this, 1000 + canonical.hashCode(), intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        updateNotification("Comando recebido: abrir $canonical • toque na ação abaixo para concluir")
+        sendState("Toque em Abrir $canonical na notificação para concluir o comando")
+        return true
+    }
+
+    private fun tryNavigateHome(command: String): Boolean {
+        val closePrefixes = listOf("feche ", "fechar ", "encerre ", "encerrar ", "sair do ", "saia do ", "fecha ", "fechar aplicativo ", "fechar app ")
+        val homeRequests = listOf("volte para a tela inicial", "ir para tela inicial", "voltar para tela inicial", "volte ao inicio", "voltar ao inicio", "feche o aplicativo", "fechar o aplicativo", "feche o app", "fechar o app")
+        val isClose = closePrefixes.any { command.startsWith(it) } || homeRequests.any { command.contains(it) }
+        if (!isClose) return false
+
+        val homeIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        notificationActionLabel = "Ir para tela inicial"
+        notificationActionPending = PendingIntent.getActivity(
+            this, 1999, homeIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        updateNotification("O Android não permite forçar o fechamento de outro app • toque abaixo para sair dele")
+        sendState("Toque em Ir para tela inicial para sair do aplicativo atual")
+        return true
     }
 
     // O serviço executa comandos de voz sem depender da Activity estar aberta.
@@ -642,11 +658,7 @@ class WakeWordService : Service() {
         }
     }
 
-    private fun buildNotification(
-        message: String,
-        launchLabel: String? = null,
-        launchPending: PendingIntent? = null
-    ): Notification {
+    private fun buildNotification(message: String): Notification {
         val openIntent = Intent(this, MainActivity::class.java).addFlags(
             Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         )
@@ -664,19 +676,15 @@ class WakeWordService : Service() {
             .setStyle(Notification.BigTextStyle().bigText(message))
             .setContentIntent(openPending)
             .setOngoing(true)
-        if (launchPending != null && !launchLabel.isNullOrBlank()) {
-            builder.addAction(android.R.drawable.ic_media_play, "Abrir $launchLabel", launchPending)
+        if (notificationActionPending != null && !notificationActionLabel.isNullOrBlank()) {
+            builder.addAction(android.R.drawable.ic_media_play, notificationActionLabel, notificationActionPending)
         }
         return builder.addAction(android.R.drawable.ic_media_pause, "Desativar", stopPending).build()
     }
 
-    private fun updateNotification(
-        message: String,
-        launchLabel: String? = null,
-        launchPending: PendingIntent? = null
-    ) {
+    private fun updateNotification(message: String) {
         getSystemService(NotificationManager::class.java)
-            .notify(NOTIFICATION_ID, buildNotification(message, launchLabel, launchPending))
+            .notify(NOTIFICATION_ID, buildNotification(message))
     }
 
     @Suppress("DEPRECATION")
