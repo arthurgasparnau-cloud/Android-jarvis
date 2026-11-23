@@ -17,6 +17,11 @@
         android:usesCleartextTraffic="false"
         android:allowBackup="false"
         android:supportsRtl="true">
+        <provider
+            android:name=".CameraCaptureProvider"
+            android:authorities="com.jarvis.mobile.camera"
+            android:exported="false"
+            android:grantUriPermissions="true" />
         <service
             android:name=".WakeWordService"
             android:exported="false"

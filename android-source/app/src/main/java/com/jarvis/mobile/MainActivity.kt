@@ -128,6 +128,7 @@ class MainActivity : Activity() {
     private val speechRequest = 4103
     private val wakeSpeechRequest = 4106
     private val cameraRequest = 4105
+    private var cameraCaptureUri: android.net.Uri? = null
     private var wakeSpeechPending = false
 
     private var baseUrl = ""
@@ -879,9 +880,18 @@ class MainActivity : Activity() {
             return
         }
         try {
-            startActivityForResult(Intent(MediaStore.ACTION_IMAGE_CAPTURE), cameraRequest)
-        } catch (_: Exception) {
-            addBubble("Sistema", "Não encontrei um aplicativo de câmera disponível neste celular.", false)
+            val captureUri = android.net.Uri.parse("content://com.jarvis.mobile.camera/camera.jpg")
+            cameraCaptureUri = captureUri
+            val intent = Intent(MediaStore.ACTION_IMAGE_CAPTURE).apply {
+                putExtra(MediaStore.EXTRA_OUTPUT, captureUri)
+                clipData = android.content.ClipData.newUri(contentResolver, "JARVIS camera capture", captureUri)
+                addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivityForResult(intent, cameraRequest)
+            setStatus("Câmera aberta • aguardando captura em resolução original", true)
+        } catch (error: Exception) {
+            cameraCaptureUri = null
+            addBubble("Sistema", "Não consegui abrir a câmera: ${error.message ?: "aplicativo indisponível"}.", false)
         }
     }
 
@@ -889,14 +899,20 @@ class MainActivity : Activity() {
         setStatus("Preparando imagem para análise…", true)
         executor.execute {
             try {
-                val maxSide = 1280
+                val maxSide = 1600
                 val scale = minOf(1f, maxSide.toFloat() / maxOf(bitmap.width, bitmap.height))
                 val resized = if (scale < 1f) Bitmap.createScaledBitmap(
                     bitmap, (bitmap.width * scale).toInt().coerceAtLeast(1),
                     (bitmap.height * scale).toInt().coerceAtLeast(1), true
                 ) else bitmap
                 val output = ByteArrayOutputStream()
-                resized.compress(Bitmap.CompressFormat.JPEG, 82, output)
+                var quality = 84
+                resized.compress(Bitmap.CompressFormat.JPEG, quality, output)
+                while (output.size() > 3_600_000 && quality > 60) {
+                    quality -= 6
+                    output.reset()
+                    resized.compress(Bitmap.CompressFormat.JPEG, quality, output)
+                }
                 if (resized !== bitmap) resized.recycle()
                 val encoded = Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
                 if (encoded.length > 5 * 1024 * 1024) throw IllegalStateException("A imagem ficou maior que o limite de envio.")
@@ -1172,10 +1188,28 @@ class MainActivity : Activity() {
             val spoken = data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull().orEmpty()
             if (spoken.isNotBlank()) sendMessage(spoken)
             else setStatus("Não consegui transcrever sua fala. Tente novamente.")
-        } else if (requestCode == cameraRequest && resultCode == RESULT_OK) {
-            val photo = data?.extras?.get("data") as? Bitmap
-            if (photo != null) analyzeCameraImage(photo)
-            else setStatus("A câmera não retornou uma imagem. Tente novamente.")
+        } else if (requestCode == cameraRequest) {
+            val captureUri = cameraCaptureUri
+            cameraCaptureUri = null
+            if (resultCode == RESULT_OK && captureUri != null) {
+                try {
+                    val photo = contentResolver.openInputStream(captureUri)?.use {
+                        android.graphics.BitmapFactory.decodeStream(it)
+                    }
+                    val finalPhoto = photo ?: (data?.extras?.get("data") as? Bitmap)
+                    if (finalPhoto != null) analyzeCameraImage(finalPhoto)
+                    else setStatus("A câmera não salvou uma imagem válida. Tente novamente.")
+                } catch (error: Exception) {
+                    addBubble("Sistema", "Não consegui ler a foto capturada: ${error.message ?: "arquivo indisponível"}.", false)
+                    setStatus("Falha ao carregar imagem")
+                }
+            } else if (resultCode == RESULT_OK) {
+                val fallback = data?.extras?.get("data") as? Bitmap
+                if (fallback != null) analyzeCameraImage(fallback)
+                else setStatus("A câmera não retornou uma imagem. Tente novamente.")
+            } else {
+                setStatus("Captura cancelada")
+            }
         }
     }
 
