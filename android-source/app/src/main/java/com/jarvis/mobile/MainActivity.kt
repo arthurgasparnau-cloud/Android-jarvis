@@ -29,6 +29,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
+import android.view.animation.DecelerateInterpolator
 import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.EditText
@@ -70,6 +71,7 @@ class MainActivity : Activity() {
     private lateinit var micButton: Button
     private lateinit var wakeButton: Button
     private var drawerPopup: PopupWindow? = null
+    private var drawerPanel: View? = null
     private var wakeReceiverRegistered = false
     private var pendingWakeStart = false
     private val notificationPermissionRequest = 4104
@@ -561,7 +563,7 @@ class MainActivity : Activity() {
                                 messages.removeAllViews()
                                 loadMessages()
                                 setStatus("Conversa aberta", true)
-                                drawerPopup?.dismiss()
+                                closeConversationDrawer()
                             }
                         }
                         list.addView(row, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(5) })
@@ -574,15 +576,48 @@ class MainActivity : Activity() {
                         elevation = dp(18).toFloat()
                     }
                     drawerPopup = popup
-                    close.setOnClickListener { popup.dismiss() }
-                    popup.setOnDismissListener { if (drawerPopup === popup) drawerPopup = null }
+                    drawerPanel = drawer
+                    close.setOnClickListener { closeConversationDrawer() }
+                    popup.setOnDismissListener {
+                        if (drawerPopup === popup) {
+                            drawerPopup = null
+                            drawerPanel = null
+                        }
+                    }
                     popup.showAtLocation(root, Gravity.START or Gravity.TOP, 0, 0)
+                    drawer.post {
+                        drawer.translationX = -drawer.width.toFloat()
+                        drawer.alpha = 0.72f
+                        drawer.animate()
+                            .translationX(0f)
+                            .alpha(1f)
+                            .setDuration(260L)
+                            .setInterpolator(DecelerateInterpolator())
+                            .start()
+                    }
                     setStatus("Núcleo conectado", true)
                 }
             } catch (error: Exception) {
                 setStatus(friendlyError(error))
             }
         }
+    }
+
+    private fun closeConversationDrawer() {
+        val popup = drawerPopup ?: return
+        val panel = drawerPanel
+        if (panel == null || !popup.isShowing) {
+            popup.dismiss()
+            return
+        }
+        panel.animate().cancel()
+        panel.animate()
+            .translationX(-panel.width.toFloat())
+            .alpha(0.72f)
+            .setDuration(190L)
+            .setInterpolator(DecelerateInterpolator())
+            .withEndAction { if (drawerPopup === popup) popup.dismiss() }
+            .start()
     }
 
     private fun newConversation() {
