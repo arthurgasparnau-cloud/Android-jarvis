@@ -1225,7 +1225,7 @@ class MainActivity : Activity() {
         connection.connectTimeout = 12000
         connection.readTimeout = when (path) {
             "/api/chat" -> 190000
-            "/api/vision" -> 150000
+            "/api/vision" -> 300000
             else -> 20000
         }
         connection.setRequestProperty("Accept", "application/json")
